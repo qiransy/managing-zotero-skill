@@ -1,7 +1,7 @@
 # managing-zotero Skill 设计规格
 
 - 日期：2026-08-20
-- 状态：待用户审阅
+- 状态：设计已批准；Zotero 10 本地授权兼容性已实机验证
 - 适用环境：Windows 10（64 位）、Zotero 10（64 位）、Codex 桌面端
 - 定位：通用 Zotero 文献管理 Skill，支持按研究方向加载领域配置；首个内置配置为微波转动光谱与计算化学
 
@@ -142,6 +142,8 @@ Skill 不覆盖用户个人笔记。若条目已存在当前领域配置对应�
 4. 无全文时只能进行元数据级或摘要级概述，不能标记为 `全文已核查`、`已精读` 或 `可用于论文`。
 5. PDF 下载或附件写入失败不阻止已批准的元数据写入；实际状态必须在结果中明确报告。
 6. 用户后来手动加入 PDF 后，可指定该条目再次运行全文核查和文献卡更新流程。
+7. 第一版对用户批准后保存在稳定 D 盘科研目录中的 PDF，默认创建 Zotero `linked_file` 附件并在预览中显示绝对路径；不把临时下载文件或任务脚本作为附件。移动源 PDF 会导致链接失效，因此写入前必须确认文件已位于最终目录。
+8. 第一版不实现需要远程存储交互的 Zotero 二进制文件上传；以后若增加 `stored_file` 模式，需另行设计、测试并取得用户批准。
 
 ## 8. 重复项识别与复用
 
@@ -189,6 +191,26 @@ Zotero 10 本地 API 的写入授权由 Zotero 自身确认界面控制。用户
 6. 第一次真实写入前提醒用户备份 Zotero 数据目录或确认已有可用备份。
 7. Zotero 未运行、本地 API 未启用或用户拒绝授权时，流程停留在预览或只读阶段。
 
+### 10.1 能力检测与授权兼容
+
+Zotero 10 本地写入在当前版本中仍处于接口过渡阶段，Skill 不仅依据版本名称判断能力，而是在每个会话中执行运行时检测：
+
+1. 先对 `/api/` 发送只读 `GET`，读取 `Zotero-API-Version`、`Zotero-Schema-Version` 和 `Zotero-Server-ID`。
+2. 缺少 Server ID、API 版本不兼容或授权端点不可用时，明确降级为只读模式，不尝试 Web API、Connector API 或 SQLite 替代写入。
+3. 调用 `POST /api/local/authorize` 前必须先得到用户对“授权测试”或具体写入批次的明确同意，并把应用名显示为 `Codex managing-zotero`。
+4. 第一版默认使用“仅允许一次”的本地授权。返回的本地 API Key 仅保存在当前进程内存中，不输出、不写入日志、不写入环境变量或配置文件，并在一次写入请求后丢弃。
+5. 一个批次需要多个 API 写请求时，每个请求分别取得授权；不通过持久保存密钥来减少 Zotero 弹窗。
+6. 用户拒绝、超时、接口返回 `401/403/405/501` 或 Server ID 改变时，停止相应写入并报告实际状态。
+
+### 10.2 2026-08-20 实机验证结果
+
+在用户明确批准下完成了两项不改动文献库的测试：
+
+- `/api/` 只读连接返回 HTTP 200、API 版本 3、Schema 版本 44，并提供 Server ID。
+- `/api/local/authorize` 返回 HTTP 200；用户选择“仅允许一次”，授权成功。
+
+测试没有读取具体 Collection 或文献，没有执行条目、Collection、附件或笔记写入。返回密钥未显示、未保存，并随测试进程结束而丢弃。这证明当前电脑上的 Zotero 10 支持计划采用的本地弹窗授权流程，但 Skill 仍须保留运行时能力检测以保持普适性。
+
 ## 11. 处理流程
 
 完整数据流为：
@@ -232,8 +254,15 @@ skill/managing-zotero/
 │   └── openai.yaml
 ├── scripts/
 │   ├── zotero_local.py
+│   ├── zotero_client.py
+│   ├── zotero_models.py
+│   ├── zotero_dedupe.py
+│   ├── zotero_workflow.py
+│   ├── zotero_audit.py
 │   └── tests/
 ├── references/
+│   ├── zotero-local-api.md
+│   ├── safety-and-approval.md
 │   └── profiles/
 │       └── microwave-spectroscopy-schema.md
 └── assets/
@@ -254,11 +283,14 @@ skill/managing-zotero/
 
 - 本地 API 连接和服务器身份检查。
 - 写入授权状态处理。
+- Server ID、授权端点和写入能力探测；不支持时安全降级为只读。
+- 本地 API Key 不输出、不持久化，并在单次写请求后丢弃。
 - DOI、PMID、arXiv 和题名作者组合查重。
 - 未得到用户批准时绝不调用写入。
 - 预览后版本冲突会中止受影响条目。
 - 部分失败能被回读并准确报告。
 - 代码中不存在直接 SQLite 修改和 DELETE 路径。
+- PDF 只有在位于用户批准的最终 D 盘目录后才创建 `linked_file` 附件。
 - 通用核心在不加载微波光谱配置时仍能完成安全的 Zotero 管理流程。
 
 ### 14.2 Skill 行为测试
