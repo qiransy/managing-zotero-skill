@@ -110,6 +110,8 @@ class ZoteroClient:
         if normalized_path != "/api":
             raise ValueError("Zotero base URL must target /api/")
         self._base_url = base_url.rstrip("/") + "/"
+        self._host = parsed.hostname
+        self._port = parsed.port
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
         self._capability: CapabilityStatus | None = None
@@ -128,20 +130,20 @@ class ZoteroClient:
         api_version = self._header(response.headers, "Zotero-API-Version")
         schema_version = self._header(response.headers, "Zotero-Schema-Version")
         server_id = self._header(response.headers, "Zotero-Server-ID")
-        missing = []
-        if not api_version:
-            missing.append("API version")
-        if not schema_version:
-            missing.append("schema version")
+        problems = []
+        if api_version != "3":
+            problems.append("API version must be 3")
+        if not schema_version.isdecimal() or int(schema_version or "0") <= 0:
+            problems.append("schema version must be a positive decimal integer")
         if not server_id:
-            missing.append("Server ID")
+            problems.append("Server ID is missing")
         status = CapabilityStatus(
             connected=True,
             api_version=api_version,
             schema_version=schema_version,
             server_id=server_id,
-            write_candidate=not missing,
-            reason="Missing " + ", ".join(missing) if missing else "",
+            write_candidate=not problems,
+            reason="; ".join(problems),
         )
         self._capability = status
         return status
@@ -163,10 +165,15 @@ class ZoteroClient:
         )
         self._raise_for_response(response, operation="authorization")
         payload = response.json()
-        if not isinstance(payload, Mapping) or not isinstance(payload.get("key"), str) or not payload["key"]:
+        if (
+            not isinstance(payload, Mapping)
+            or not isinstance(payload.get("key"), str)
+            or not payload["key"]
+            or payload.get("remember") is not False
+        ):
             raise ZoteroAuthorizationError("Zotero did not return a usable one-time authorization")
         server_id = self._header(response.headers, "Zotero-Server-ID") or capability.server_id
-        return self._authorization_from_response(payload["key"], bool(payload.get("remember", False)), server_id)
+        return self._authorization_from_response(payload["key"], False, server_id)
 
     def post_json(
         self,
@@ -183,6 +190,7 @@ class ZoteroClient:
         if authorization.server_id != capability.server_id:
             raise ZoteroAuthorizationError("Zotero Server ID changed; obtain a new local authorization")
         key = authorization.consume()
+        headers: dict[str, str] = {}
         try:
             headers = {
                 "Content-Type": "application/json",
@@ -200,6 +208,7 @@ class ZoteroClient:
             self._raise_for_response(response, operation="write")
             return response.json(), response
         finally:
+            headers.pop("Zotero-API-Key", None)
             key = ""
 
     def _request(
@@ -212,12 +221,23 @@ class ZoteroClient:
     ) -> HttpResponse:
         if method not in {"GET", "POST"}:
             raise ValueError("Only GET and POST requests are allowed")
+        path_parts = urllib.parse.urlparse(path)
+        if path_parts.scheme or path_parts.netloc:
+            raise ValueError("Zotero request path must be relative to the local API")
         cleaned_path = path.lstrip("/")
         url = urllib.parse.urljoin(self._base_url, cleaned_path)
         if query:
             url += "?" + urllib.parse.urlencode(query)
+        target = urllib.parse.urlparse(url)
+        if (
+            target.scheme != "http"
+            or target.hostname != self._host
+            or target.port != self._port
+        ):
+            raise ValueError("Zotero request must remain on the configured loopback API")
         try:
-            return self._transport.request(method, url, headers=headers, body=body, timeout=self._timeout)
+            response = self._transport.request(method, url, headers=headers, body=body, timeout=self._timeout)
+            return self._sanitize_response(response)
         except ZoteroConnectionError:
             raise
         except (OSError, TimeoutError, socket.timeout) as error:
@@ -241,7 +261,29 @@ class ZoteroClient:
         return any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in cls._WRITE_PREFIXES)
 
     @staticmethod
-    def _raise_for_response(response: HttpResponse, operation: str) -> None:
+    def _sanitize_response(response: HttpResponse) -> HttpResponse:
+        headers = {
+            name: value
+            for name, value in response.headers.items()
+            if name.lower() != "zotero-api-key"
+        }
+        return HttpResponse(response.status, headers, response.body)
+
+    def _latch_read_only(self, reason: str) -> None:
+        capability = self._capability
+        if capability is None:
+            self._capability = CapabilityStatus(connected=True, reason=reason)
+            return
+        self._capability = CapabilityStatus(
+            connected=capability.connected,
+            api_version=capability.api_version,
+            schema_version=capability.schema_version,
+            server_id=capability.server_id,
+            write_candidate=False,
+            reason=reason,
+        )
+
+    def _raise_for_response(self, response: HttpResponse, operation: str) -> None:
         if 200 <= response.status < 300:
             return
         if response.status in {401, 403}:
@@ -251,5 +293,6 @@ class ZoteroClient:
         if response.status == 409:
             raise ZoteroLibraryLockedError("Zotero library is locked; do not retry automatically")
         if response.status in {405, 501} and operation in {"authorization", "write"}:
+            self._latch_read_only("Zotero local API write authorization is unavailable; read-only mode")
             raise ZoteroAuthorizationError("Zotero local API write authorization is unavailable; read-only mode")
         raise ZoteroConnectionError(f"Local Zotero API returned HTTP {response.status}")
