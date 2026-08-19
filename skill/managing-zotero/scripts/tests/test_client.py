@@ -170,6 +170,89 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(request.get_header("Zotero-api-version"), "3")
         self.assertNotIn("Mozilla", request.get_header("User-agent"))
 
+    def test_read_path_cannot_replace_loopback_origin(self):
+        transport = FakeTransport([])
+        client = ZoteroClient(transport=transport)
+        with self.assertRaises(ValueError):
+            client.get_json("https://api.zotero.org/users/0/items")
+        self.assertEqual(transport.requests, [])
+
+    def test_echoed_authorization_key_is_removed_from_response_headers(self):
+        transport = FakeTransport([
+            HttpResponse(
+                200,
+                {"Zotero-API-Version": "3", "Zotero-Schema-Version": "44", "Zotero-Server-ID": "SERVER-ONE"},
+                b"{}",
+            ),
+            HttpResponse(200, {"Zotero-API-Key": "top-secret"}, b"[]"),
+        ])
+        client = ZoteroClient(transport=transport)
+        authorization = client._authorization_from_response("top-secret", False, "SERVER-ONE")
+        _, response = client.post_json("users/0/collections", [], authorization)
+        self.assertNotIn("zotero-api-key", {name.lower() for name in response.headers})
+        self.assertNotIn("top-secret", repr(response.headers))
+
+    def test_incompatible_or_malformed_capability_is_read_only(self):
+        for api_version, schema_version in (("2", "44"), ("3", "0"), ("3", "forty-four")):
+            with self.subTest(api_version=api_version, schema_version=schema_version):
+                transport = FakeTransport([
+                    HttpResponse(
+                        200,
+                        {
+                            "Zotero-API-Version": api_version,
+                            "Zotero-Schema-Version": schema_version,
+                            "Zotero-Server-ID": "SERVER-ONE",
+                        },
+                        b"{}",
+                    ),
+                ])
+                status = ZoteroClient(transport=transport).probe()
+                self.assertTrue(status.connected)
+                self.assertFalse(status.write_candidate)
+
+    def test_unavailable_authorization_latches_read_only_capability(self):
+        transport = FakeTransport([
+            HttpResponse(
+                200,
+                {"Zotero-API-Version": "3", "Zotero-Schema-Version": "44", "Zotero-Server-ID": "SERVER-ONE"},
+                b"{}",
+            ),
+            HttpResponse(405, {}, b"not supported"),
+        ])
+        client = ZoteroClient(transport=transport)
+        with self.assertRaises(ZoteroAuthorizationError):
+            client.authorize_once()
+        self.assertFalse(client._capability.write_candidate)
+
+    def test_unavailable_write_latches_read_only_capability(self):
+        transport = FakeTransport([
+            HttpResponse(
+                200,
+                {"Zotero-API-Version": "3", "Zotero-Schema-Version": "44", "Zotero-Server-ID": "SERVER-ONE"},
+                b"{}",
+            ),
+            HttpResponse(501, {}, b"not supported"),
+        ])
+        client = ZoteroClient(transport=transport)
+        authorization = client._authorization_from_response("secret", False, "SERVER-ONE")
+        with self.assertRaises(ZoteroAuthorizationError):
+            client.post_json("users/0/collections", [], authorization)
+        self.assertFalse(client._capability.write_candidate)
+
+    def test_authorization_rejects_persistent_or_malformed_remember_value(self):
+        for remember in (True, "false"):
+            with self.subTest(remember=remember):
+                transport = FakeTransport([
+                    HttpResponse(
+                        200,
+                        {"Zotero-API-Version": "3", "Zotero-Schema-Version": "44", "Zotero-Server-ID": "SERVER-ONE"},
+                        b"{}",
+                    ),
+                    HttpResponse(200, {"Zotero-Server-ID": "SERVER-ONE"}, json.dumps({"key": "secret", "remember": remember}).encode()),
+                ])
+                with self.assertRaises(ZoteroAuthorizationError):
+                    ZoteroClient(transport=transport).authorize_once()
+
 
 if __name__ == "__main__":
     unittest.main()
