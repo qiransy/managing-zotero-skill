@@ -224,6 +224,22 @@ class ClientTests(unittest.TestCase):
             client.authorize_once()
         self.assertFalse(client._capability.write_candidate)
 
+    def test_read_only_latch_blocks_later_authorization_without_dispatch(self):
+        transport = FakeTransport([
+            HttpResponse(
+                200,
+                {"Zotero-API-Version": "3", "Zotero-Schema-Version": "44", "Zotero-Server-ID": "SERVER-ONE"},
+                b"{}",
+            ),
+            HttpResponse(405, {}, b"not supported"),
+        ])
+        client = ZoteroClient(transport=transport)
+        with self.assertRaises(ZoteroAuthorizationError):
+            client.authorize_once()
+        with self.assertRaises(ZoteroAuthorizationError):
+            client.authorize_once()
+        self.assertEqual(len(transport.requests), 2)
+
     def test_unavailable_write_latches_read_only_capability(self):
         transport = FakeTransport([
             HttpResponse(
