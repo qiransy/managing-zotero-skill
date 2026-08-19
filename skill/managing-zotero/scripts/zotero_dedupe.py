@@ -11,6 +11,8 @@ from zotero_models import CandidateItem, DuplicateMatch, MatchKind
 _DOI_PREFIX = re.compile(r"^(?:doi\s*:\s*|https?://(?:dx\.)?doi\.org/)", re.IGNORECASE)
 _PMID_PREFIX = re.compile(r"^pmid\s*:\s*", re.IGNORECASE)
 _ARXIV_PREFIX = re.compile(r"^(?:arxiv\s*:\s*|https?://arxiv\.org/(?:abs|pdf)/)", re.IGNORECASE)
+_ARXIV_IDENTIFIER = re.compile(r"^(?:(?:\d{4}\.\d{4,5})|(?:[a-z-]+/\d{7}))(?:v\d+)?$", re.IGNORECASE)
+_ARXIV_REVISION = re.compile(r"v\d+$", re.IGNORECASE)
 _PMID_IN_EXTRA = re.compile(r"(?:^|\n)\s*pmid\s*:\s*([^\s;,]+)", re.IGNORECASE)
 _ARXIV_IN_EXTRA = re.compile(r"(?:^|\n)\s*arxiv\s*:\s*([^\s;,]+)", re.IGNORECASE)
 _YEAR = re.compile(r"(?<!\d)(\d{4})(?!\d)")
@@ -28,14 +30,17 @@ def normalize_external_id(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value or "").strip()
     normalized = _PMID_PREFIX.sub("", normalized)
     normalized = _ARXIV_PREFIX.sub("", normalized)
-    return normalized.strip(" \t\r\n.,;:<>[]{}\"").casefold()
+    normalized = normalized.strip(" \t\r\n.,;:<>[]{}\"").casefold()
+    if _ARXIV_IDENTIFIER.fullmatch(normalized):
+        return _ARXIV_REVISION.sub("", normalized)
+    return normalized
 
 
 def normalize_title(value: str) -> str:
     """Return a comparison-only title representation."""
     normalized = unicodedata.normalize("NFKC", value or "")
     normalized = "".join("-" if unicodedata.category(char) == "Pd" else char for char in normalized)
-    normalized = " ".join(normalized.split()).casefold()
+    normalized = " ".join(normalized.split()).strip().casefold()
     return _strip_surrounding_punctuation(normalized)
 
 

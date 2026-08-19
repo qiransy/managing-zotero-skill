@@ -4,11 +4,14 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from zotero_dedupe import classify_duplicate
+from zotero_dedupe import classify_duplicate, normalize_title
 from zotero_models import CandidateItem, MatchKind
 
 
 class DuplicateClassificationTests(unittest.TestCase):
+    def test_title_normalization_removes_quotes_after_outer_whitespace(self):
+        self.assertEqual(normalize_title('  “Water complex”  '), "water complex")
+
     def test_doi_url_and_plain_doi_are_exact_duplicates(self):
         candidate = CandidateItem(title="Different", doi="https://doi.org/10.1000/ABC")
         existing = [{"key": "ITEM0001", "data": {"DOI": "10.1000/abc"}}]
@@ -37,6 +40,16 @@ class DuplicateClassificationTests(unittest.TestCase):
 
         self.assertEqual(match.kind, MatchKind.EXACT_IDENTIFIER)
         self.assertEqual(match.item_key, "ITEM0005")
+        self.assertEqual(match.reasons, ("arxiv",))
+
+    def test_unversioned_arxiv_matches_a_versioned_extra_identifier(self):
+        candidate = CandidateItem(title="Different", arxiv_id="2401.01234")
+        existing = [{"key": "ITEM0008", "data": {"extra": "arXiv: 2401.01234v2"}}]
+
+        match = classify_duplicate(candidate, existing)
+
+        self.assertEqual(match.kind, MatchKind.EXACT_IDENTIFIER)
+        self.assertEqual(match.item_key, "ITEM0008")
         self.assertEqual(match.reasons, ("arxiv",))
 
     def test_title_author_year_is_probable_not_automatic_merge(self):
