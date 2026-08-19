@@ -52,6 +52,16 @@ class DuplicateClassificationTests(unittest.TestCase):
         self.assertEqual(match.item_key, "ITEM0008")
         self.assertEqual(match.reasons, ("arxiv",))
 
+    def test_unversioned_legacy_arxiv_matches_a_versioned_dotted_category_identifier(self):
+        candidate = CandidateItem(title="Different", arxiv_id="math.GT/0309136")
+        existing = [{"key": "ITEM0009", "data": {"extra": "arXiv: math.GT/0309136v2"}}]
+
+        match = classify_duplicate(candidate, existing)
+
+        self.assertEqual(match.kind, MatchKind.EXACT_IDENTIFIER)
+        self.assertEqual(match.item_key, "ITEM0009")
+        self.assertEqual(match.reasons, ("arxiv",))
+
     def test_title_author_year_is_probable_not_automatic_merge(self):
         candidate = CandidateItem(
             title="The ethanolamine-water complex",

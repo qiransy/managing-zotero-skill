@@ -11,7 +11,10 @@ from zotero_models import CandidateItem, DuplicateMatch, MatchKind
 _DOI_PREFIX = re.compile(r"^(?:doi\s*:\s*|https?://(?:dx\.)?doi\.org/)", re.IGNORECASE)
 _PMID_PREFIX = re.compile(r"^pmid\s*:\s*", re.IGNORECASE)
 _ARXIV_PREFIX = re.compile(r"^(?:arxiv\s*:\s*|https?://arxiv\.org/(?:abs|pdf)/)", re.IGNORECASE)
-_ARXIV_IDENTIFIER = re.compile(r"^(?:(?:\d{4}\.\d{4,5})|(?:[a-z-]+/\d{7}))(?:v\d+)?$", re.IGNORECASE)
+_ARXIV_IDENTIFIER = re.compile(
+    r"^(?:(?:\d{4}\.\d{4,5})|(?:[a-z-]+(?:\.[a-z-]+)*/\d{7}))(?:v\d+)?$",
+    re.IGNORECASE,
+)
 _ARXIV_REVISION = re.compile(r"v\d+$", re.IGNORECASE)
 _PMID_IN_EXTRA = re.compile(r"(?:^|\n)\s*pmid\s*:\s*([^\s;,]+)", re.IGNORECASE)
 _ARXIV_IN_EXTRA = re.compile(r"(?:^|\n)\s*arxiv\s*:\s*([^\s;,]+)", re.IGNORECASE)
