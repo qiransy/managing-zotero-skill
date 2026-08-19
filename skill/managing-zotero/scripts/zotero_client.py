@@ -115,6 +115,7 @@ class ZoteroClient:
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
         self._capability: CapabilityStatus | None = None
+        self._write_disabled_reason = ""
 
     def probe(self) -> CapabilityStatus:
         try:
@@ -145,6 +146,15 @@ class ZoteroClient:
             write_candidate=not problems,
             reason="; ".join(problems),
         )
+        if self._write_disabled_reason:
+            status = CapabilityStatus(
+                connected=status.connected,
+                api_version=status.api_version,
+                schema_version=status.schema_version,
+                server_id=status.server_id,
+                write_candidate=False,
+                reason=self._write_disabled_reason,
+            )
         self._capability = status
         return status
 
@@ -154,6 +164,8 @@ class ZoteroClient:
         return response.json(), response
 
     def authorize_once(self, app_name: str = "Codex managing-zotero") -> LocalAuthorization:
+        if self._write_disabled_reason:
+            raise ZoteroAuthorizationError(self._write_disabled_reason)
         capability = self.probe()
         if not capability.connected or not capability.write_candidate:
             raise ZoteroAuthorizationError(capability.reason or "Zotero local API is read-only")
@@ -184,6 +196,8 @@ class ZoteroClient:
     ) -> tuple[object, HttpResponse]:
         if not self._is_allowed_write_path(path):
             raise ValueError("This Zotero write endpoint is not allowed")
+        if self._write_disabled_reason:
+            raise ZoteroAuthorizationError(self._write_disabled_reason)
         capability = self._capability or self.probe()
         if not capability.connected or not capability.write_candidate:
             raise ZoteroAuthorizationError(capability.reason or "Zotero local API is read-only")
@@ -270,6 +284,7 @@ class ZoteroClient:
         return HttpResponse(response.status, headers, response.body)
 
     def _latch_read_only(self, reason: str) -> None:
+        self._write_disabled_reason = reason
         capability = self._capability
         if capability is None:
             self._capability = CapabilityStatus(connected=True, reason=reason)
