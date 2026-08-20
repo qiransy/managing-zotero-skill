@@ -8,7 +8,9 @@ from pathlib import Path
 import re
 import secrets
 from typing import Any, Iterable, Mapping
+import warnings
 
+from zotero_audit import AuditEvent, append_audit_event
 from zotero_dedupe import classify_duplicate
 from zotero_models import (
     CandidateItem,
@@ -126,13 +128,7 @@ def execute_plan(
     proof: ApprovalProof,
     audit_dir: str | Path | None = None,
 ) -> ExecutionResult:
-    """Apply exactly one reviewed request, then return its verified actual state.
-
-    ``audit_dir`` is intentionally unused until the append-only audit component is
-    introduced; accepting it keeps the approval boundary stable without writing an
-    unaudited side channel here.
-    """
-    del audit_dir
+    """Apply exactly one reviewed request, read it back, and audit the result."""
     _validate_plan(plan)
     if not proof.user_confirmed:
         raise ApprovalRequired("explicit user confirmation is required")
@@ -147,12 +143,24 @@ def execute_plan(
 
     authorization = client.authorize_once()
     try:
-        response, _ = client.post_json(
-            _write_path(plan),
-            _write_payload(plan),
-            authorization,
-            expected_version=plan.library_version,
-        )
+        try:
+            response, _ = client.post_json(
+                _write_path(plan),
+                _write_payload(plan),
+                authorization,
+                expected_version=plan.library_version,
+            )
+        except Exception as exc:
+            _audit_attempt(
+                audit_dir,
+                plan,
+                calculated_digest,
+                outcome="error",
+                failed={"mutation": type(exc).__name__},
+                verified=None,
+                verification_status="not_available",
+            )
+            raise
     finally:
         discard = getattr(client, "discard_authorization", None)
         if callable(discard):
@@ -160,17 +168,43 @@ def execute_plan(
 
     successful, unchanged, failed = _parse_write_response(response, plan)
     affected_keys = tuple(dict.fromkeys((*successful, *unchanged)))
-    fetched = _fetch_objects(client, plan, affected_keys)
-    readback_ok, mismatches = verify_readback(plan, fetched)
+    try:
+        fetched = _fetch_objects(client, plan, affected_keys)
+        readback_ok, mismatches = verify_readback(plan, fetched)
+    except Exception as exc:
+        _audit_attempt(
+            audit_dir,
+            plan,
+            calculated_digest,
+            outcome="readback_error",
+            successful=successful,
+            unchanged=unchanged,
+            failed=failed | {"readback": type(exc).__name__},
+            verified=None,
+            verification_status="error",
+        )
+        raise
     if failed:
         readback_ok = False
-    return ExecutionResult(
+    result = ExecutionResult(
         plan_digest=calculated_digest,
         successful_keys=successful,
         unchanged_keys=unchanged,
         failed=failed | mismatches,
         verified=readback_ok,
     )
+    _audit_attempt(
+        audit_dir,
+        plan,
+        calculated_digest,
+        outcome=_audit_outcome(result),
+        successful=result.successful_keys,
+        unchanged=result.unchanged_keys,
+        failed=result.failed,
+        verified=result.verified,
+        verification_status="verified" if result.verified else "mismatch",
+    )
+    return result
 
 
 def verify_readback(plan: WritePlan, fetched_objects: Mapping[str, Any]) -> tuple[bool, dict[str, str]]:
@@ -202,6 +236,50 @@ def verify_readback(plan: WritePlan, fetched_objects: Mapping[str, Any]) -> tupl
         used_keys.add(key)
         _compare_item_fields(expected, actual, label, mismatches)
     return not mismatches, mismatches
+
+
+def _audit_attempt(
+    audit_dir: str | Path | None,
+    plan: WritePlan,
+    digest: str,
+    *,
+    outcome: str,
+    successful: tuple[str, ...] = (),
+    unchanged: tuple[str, ...] = (),
+    failed: Mapping[str, str] | None = None,
+    verified: bool | None,
+    verification_status: str,
+) -> None:
+    """Record an attempt without ever retrying or replacing its known outcome."""
+    if audit_dir is None:
+        return
+    event = AuditEvent(
+        plan_digest=digest,
+        operation=plan.operation.value,
+        outcome=outcome,
+        target_collection={"itemKey": plan.collection_key, "name": plan.collection_name},
+        approved_action_count=len(plan.actions),
+        approved_actions=tuple(action.kind for action in plan.actions),
+        successful_item_keys=successful,
+        unchanged_item_keys=unchanged,
+        failed=dict(failed or {}),
+        verified=verified,
+        details={"verification_status": verification_status},
+    )
+    try:
+        append_audit_event(audit_dir, event)
+    except (OSError, ValueError) as exc:
+        warnings.warn(
+            f"Zotero mutation outcome is available, but its audit record could not be written: {type(exc).__name__}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _audit_outcome(result: ExecutionResult) -> str:
+    if result.failed:
+        return "partial" if result.successful_keys or result.unchanged_keys else "failed"
+    return "success" if result.verified else "unverified"
 
 
 def _validate_plan(plan: WritePlan) -> None:

@@ -1,7 +1,9 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -366,6 +368,37 @@ class PreviewAndExecutionTests(unittest.TestCase):
         self.assertEqual(result.failed, {"2": "invalid item"})
         self.assertEqual(self.client.write_calls, 1)
         self.assertFalse(result.verified)
+
+    def test_execute_writes_redacted_audit_after_readback(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd(), prefix="workflow-audit-") as temporary_directory:
+            plan = self.item_plan()
+            with patch("zotero_audit.os.fsync"):
+                result = execute_plan(
+                    self.client,
+                    plan,
+                    ApprovalProof(plan_digest(plan), True),
+                    audit_dir=Path(temporary_directory).resolve(),
+                )
+            audit_path = Path(temporary_directory) / "managing-zotero-audit.jsonl"
+            audit_event = json.loads(audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.client.write_calls, 1)
+        self.assertEqual(audit_event["plan_digest"], result.plan_digest)
+        self.assertEqual(audit_event["approved_actions"], ["upsert_items"])
+        self.assertEqual(audit_event["successful_item_keys"], ["ITEM0001"])
+        self.assertTrue(audit_event["verified"])
+
+    def test_audit_write_failure_preserves_known_mutation_outcome_without_retry(self):
+        plan = self.item_plan()
+        with patch("zotero_workflow.append_audit_event", side_effect=OSError("audit unavailable")):
+            with self.assertWarnsRegex(RuntimeWarning, "mutation outcome is available"):
+                result = execute_plan(
+                    self.client,
+                    plan,
+                    ApprovalProof(plan_digest(plan), True),
+                    audit_dir=Path.cwd().resolve(),
+                )
+        self.assertEqual(self.client.write_calls, 1)
+        self.assertEqual(result.successful_keys, ("ITEM0001",))
 
     def test_verify_readback_accepts_approved_fields_and_ignores_personal_note(self):
         plan = self.item_plan()
