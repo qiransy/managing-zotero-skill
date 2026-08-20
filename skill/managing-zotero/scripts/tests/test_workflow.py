@@ -207,10 +207,27 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn("实验：CP-FTMW", tags)
 
+    def test_full_text_and_deep_read_preserve_exact_assignments(self):
+        for evidence_level in (EvidenceLevel.FULL_TEXT_VERIFIED, EvidenceLevel.DEEP_READ):
+            with self.subTest(evidence_level=evidence_level):
+                candidate = CandidateItem(
+                    title="A paper",
+                    evidence_level=evidence_level,
+                    note_fields={"relevance": "A = 1234.567; μa = 1.2 D"},
+                    tags=("证据：A = 1234.567",),
+                )
+                note = render_note(candidate, "microwave-spectroscopy")
+                tags = sanitize_tags(candidate, "microwave-spectroscopy")
+                self.assertIn("A = 1234.567", note)
+                self.assertIn("μa = 1.2 D", note)
+                self.assertIn("证据：A = 1234.567", tags)
+
     @staticmethod
     def _prohibited_low_evidence_claims():
         return (
             "A: 1234.567 MHz",
+            "A = 1234.567",
+            "μa = 1.2 D",
             "pp. 4–5",
             "「quoted」",
         )
