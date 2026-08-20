@@ -8,6 +8,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import re
+import secrets
 import sys
 from typing import Any, Callable, Mapping, TextIO
 
@@ -19,7 +20,11 @@ from zotero_client import (
     ZoteroVersionConflict,
 )
 from zotero_models import CandidateItem, EvidenceLevel, OperationKind, WriteAction, WritePlan, canonical_json, plan_digest
-from zotero_workflow import ApprovalProof, ApprovalRequired, BatchLimitExceeded, PreviewStale, build_collection_plan, build_item_plan, candidate_to_zotero_item, execute_plan
+from zotero_workflow import (
+    ApprovalProof, ApprovalRequired, BatchLimitExceeded, DuplicateConflict, PreviewStale,
+    build_collection_plan, build_item_plan, build_linked_attachment,
+    candidate_to_zotero_item, execute_plan, render_note,
+)
 
 
 _SECRET = re.compile(r"(?i)(?:api[_-]?key|authorization|token|secret|zotero-server-id)\s*[:=]\s*[^\s,;]+")
@@ -84,6 +89,9 @@ def main(
         return _error(stderr, 4, error)
     except (PreviewStale, ZoteroVersionConflict) as error:
         return _error(stderr, 5, error)
+    except _PartialResult as error:
+        print(json.dumps(error.result, ensure_ascii=False, sort_keys=True, separators=(",", ":")), file=stdout)
+        return 6
     except Exception as error:
         return _error(stderr, 6, error)
 
@@ -108,19 +116,21 @@ def _dispatch(args: argparse.Namespace, client: Any) -> dict[str, Any]:
         payload, _ = client.get_json("users/0/items", query)
         return {"items": _item_metadata(payload)}
     if args.command == "preview-collection":
+        status = _preview_status(client)
         _, response = client.get_json("users/0/collections")
-        plan = build_collection_plan(args.name, _header_version(response))
+        plan = build_collection_plan(args.name, _header_version(response), server_id=status.server_id)
         _write_plan(args.output, plan)
         return {"plan": str(Path(args.output)), "digest": plan_digest(plan), "operation": plan.operation.value}
     if args.command == "preview-items":
+        status = _preview_status(client)
         candidates = _read_candidates(args.input)
         if len(candidates) > 10:
             raise BatchLimitExceeded("candidate file may contain at most 10 papers")
-        _validate_allowed_roots(args.allowed_root, candidates)
+        roots = _validate_allowed_roots(args.allowed_root, candidates)
         collection = _read_collection(client, args.collection_key)
-        existing, _ = client.get_json("users/0/items", {"collectionKey": args.collection_key})
-        plan = build_item_plan(candidates, collection, _as_list(existing))
-        plan = _with_profile(plan, candidates, args.profile)
+        existing = _library_matches(client, candidates)
+        plan = build_item_plan(candidates, collection, existing, server_id=status.server_id)
+        plan = _with_profile(plan, candidates, args.profile, roots)
         _write_plan(args.output, plan)
         return {"plan": str(Path(args.output)), "digest": plan_digest(plan), "operation": plan.operation.value}
     if args.command == "apply":
@@ -143,7 +153,9 @@ def _dispatch(args: argparse.Namespace, client: Any) -> dict[str, Any]:
 
 
 class _PartialResult(RuntimeError):
-    pass
+    def __init__(self, result: Mapping[str, Any]):
+        super().__init__("partial Zotero write")
+        self.result = dict(result)
 
 
 def _error(stderr: TextIO, code: int, error: Exception) -> int:
@@ -198,6 +210,39 @@ def _read_collection(client: Any, key: str) -> Mapping[str, Any]:
     return {**data, "key": key}
 
 
+def _preview_status(client: Any) -> Any:
+    status = client.probe()
+    if not status.connected or not status.server_id:
+        raise ZoteroConnectionError("local Zotero Server ID is unavailable")
+    return status
+
+
+def _library_matches(client: Any, candidates: tuple[CandidateItem, ...]) -> list[Mapping[str, Any]]:
+    found: dict[str, Mapping[str, Any]] = {}
+    for candidate in candidates:
+        if candidate.doi:
+            query = {"doi": candidate.doi}
+        elif candidate.pmid:
+            query = {"q": "PMID: " + candidate.pmid}
+        elif candidate.arxiv_id:
+            query = {"q": "arXiv: " + candidate.arxiv_id}
+        else:
+            query = {"q": candidate.title}
+        payload, _ = client.get_json("users/0/items", query)
+        for item in _as_list(payload):
+            if not isinstance(item, Mapping):
+                continue
+            key = str(item.get("key", ""))
+            if key:
+                found[key] = item
+    return list(found.values())
+
+
+def _new_key() -> str:
+    alphabet = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
 def _read_candidates(path: str) -> tuple[CandidateItem, ...]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     records = value.get("candidates") if isinstance(value, Mapping) else value
@@ -206,7 +251,7 @@ def _read_candidates(path: str) -> tuple[CandidateItem, ...]:
     return tuple(_candidate(record) for record in records)
 
 
-def _validate_allowed_roots(values: list[str], candidates: tuple[CandidateItem, ...]) -> None:
+def _validate_allowed_roots(values: list[str], candidates: tuple[CandidateItem, ...]) -> tuple[Path, ...]:
     roots = tuple(Path(value).resolve(strict=True) for value in values)
     if not roots or not all(root.is_dir() for root in roots):
         raise ValueError("allowed-root values must be existing directories")
@@ -216,17 +261,53 @@ def _validate_allowed_roots(values: list[str], candidates: tuple[CandidateItem, 
         pdf = Path(candidate.linked_pdf).resolve(strict=True)
         if not pdf.is_file() or pdf.suffix.casefold() != ".pdf" or not any(pdf.is_relative_to(root) for root in roots):
             raise ValueError("linked PDF must be an existing PDF under an allowed-root")
+    return roots
 
 
-def _with_profile(plan: WritePlan, candidates: tuple[CandidateItem, ...], profile: str) -> WritePlan:
+def _with_profile(
+    plan: WritePlan,
+    candidates: tuple[CandidateItem, ...],
+    profile: str,
+    allowed_roots: tuple[Path, ...],
+) -> WritePlan:
     payloads = plan.actions[0].payload
     if not isinstance(payloads, (list, tuple)):
         return plan
-    revised = tuple(
-        payload if isinstance(payload, Mapping) and payload.get("key") else candidate_to_zotero_item(candidate, plan.collection_key, profile)
-        for candidate, payload in zip(candidates, payloads)
+    revised: list[Mapping[str, Any]] = []
+    for candidate, payload in zip(candidates, payloads):
+        if not isinstance(payload, Mapping):
+            raise ValueError("item payload is malformed")
+        if isinstance(payload.get("version"), int) and payload.get("version", 0) > 0:
+            parent = dict(payload)
+        else:
+            parent = candidate_to_zotero_item(candidate, plan.collection_key, profile)
+            parent["key"] = str(payload.get("key") or _new_key())
+            parent["version"] = 0
+        revised.append(parent)
+        parent_key = str(parent["key"])
+        revised.append({
+            "itemType": "note",
+            "key": _new_key(),
+            "version": 0,
+            "parentItem": parent_key,
+            "note": render_note(candidate, profile),
+        })
+        if candidate.linked_pdf:
+            attachment = build_linked_attachment(parent_key, candidate.linked_pdf, allowed_roots)
+            attachment["key"] = _new_key()
+            attachment["version"] = 0
+            revised.append(attachment)
+    return WritePlan(
+        plan.operation,
+        plan.collection_key,
+        plan.collection_name,
+        (WriteAction("upsert_items", tuple(revised)),),
+        plan.expected_versions,
+        plan.library_version,
+        plan.server_fingerprint,
+        plan.duplicate_checks,
+        tuple(str(root) for root in allowed_roots),
     )
-    return WritePlan(plan.operation, plan.collection_key, plan.collection_name, (WriteAction("upsert_items", revised),), plan.expected_versions, plan.library_version)
 
 
 def _candidate(value: Any) -> CandidateItem:
@@ -274,7 +355,26 @@ def _read_plan(path: str) -> WritePlan:
     version = value.get("library_version")
     if version is not None and not isinstance(version, int):
         raise ValueError("plan library_version is invalid")
-    return WritePlan(operation, str(value.get("collection_key", "")), str(value.get("collection_name", "")), actions, dict(expected_versions), version)
+    fingerprint = value.get("server_fingerprint", "")
+    duplicate_checks = value.get("duplicate_checks", [])
+    allowed_roots = value.get("allowed_roots", [])
+    if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise ValueError("plan Server-ID fingerprint is missing or invalid")
+    if not isinstance(duplicate_checks, list) or not all(isinstance(check, Mapping) for check in duplicate_checks):
+        raise ValueError("plan duplicate bindings are invalid")
+    if not isinstance(allowed_roots, list) or not all(isinstance(root, str) for root in allowed_roots):
+        raise ValueError("plan allowed roots are invalid")
+    return WritePlan(
+        operation,
+        str(value.get("collection_key", "")),
+        str(value.get("collection_name", "")),
+        actions,
+        dict(expected_versions),
+        version,
+        fingerprint,
+        tuple(dict(check) for check in duplicate_checks),
+        tuple(allowed_roots),
+    )
 
 
 def _validate_digest(value: str) -> None:

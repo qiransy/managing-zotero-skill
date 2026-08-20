@@ -280,8 +280,11 @@ class PreviewAndExecutionTests(unittest.TestCase):
             collection_key=plan.collection_key,
             collection_name=plan.collection_name,
             actions=plan.actions,
-            expected_versions=expected_versions,
+            expected_versions={**plan.expected_versions, **expected_versions},
             library_version=plan.library_version,
+            server_fingerprint=plan.server_fingerprint,
+            duplicate_checks=plan.duplicate_checks,
+            allowed_roots=plan.allowed_roots,
         )
 
     def test_execute_refuses_missing_user_confirmation(self):
@@ -310,7 +313,7 @@ class PreviewAndExecutionTests(unittest.TestCase):
         client = _HttpOnlyVersionClient()
         with self.assertRaises(PreviewStale):
             execute_plan(client, plan, ApprovalProof(plan_digest(plan), True))
-        self.assertEqual(client.paths, ["users/0/collections/COLLECT01"])
+        self.assertEqual(client.paths, ["users/0/items", "users/0/collections/COLLECT01"])
         self.assertEqual(client.authorization_calls, 0)
 
     def test_item_plan_rejects_eleven_papers(self):
@@ -328,6 +331,30 @@ class PreviewAndExecutionTests(unittest.TestCase):
         self.assertEqual(payload["key"], "ITEM0001")
         self.assertEqual(payload["collections"], ["OTHER001", "COLLECT01"])
         self.assertNotIn("tags", payload)
+
+    def test_exact_duplicate_does_not_replace_trusted_metadata_from_candidate(self):
+        candidate = CandidateItem(
+            title="Untrusted replacement title",
+            doi="10.1000/0",
+            publication_title="Untrusted journal",
+        )
+        existing = [{
+            "key": "ITEM0001",
+            "version": 7,
+            "data": {
+                "itemType": "journalArticle",
+                "title": "Trusted Zotero title",
+                "publicationTitle": "Trusted journal",
+                "DOI": "10.1000/0",
+                "collections": ["OTHER001"],
+                "tags": [{"tag": "personal"}],
+            },
+        }]
+        plan = build_item_plan((candidate,), self.collection, existing)
+        payload = plan.actions[0].payload[0]
+        self.assertNotEqual(payload.get("title"), candidate.title)
+        self.assertNotEqual(payload.get("publicationTitle"), candidate.publication_title)
+        self.assertEqual(payload["collections"], ["OTHER001", "COLLECT01"])
 
     def test_collection_creation_and_item_upsert_cannot_share_a_plan(self):
         with self.assertRaises(ValueError):
@@ -355,13 +382,16 @@ class PreviewAndExecutionTests(unittest.TestCase):
         self.assertIn("COLLECT01.name", mismatches)
 
     def test_partial_write_reports_success_unchanged_and_failed_without_retry(self):
-        plan = self.item_plan()
+        plan = build_item_plan(self.candidates(3), self.collection, [])
         self.client.write_response = {
             "successful": {"0": "ITEM0001"},
             "unchanged": {"1": "ITEM0002"},
             "failed": {"2": {"message": "invalid item"}},
         }
-        self.client.fetched_objects = {"ITEM0001": plan.actions[0].payload[0]}
+        self.client.fetched_objects = {
+            "ITEM0001": {**plan.actions[0].payload[0], "key": "ITEM0001"},
+            "ITEM0002": {**plan.actions[0].payload[1], "key": "ITEM0002"},
+        }
         result = execute_plan(self.client, plan, ApprovalProof(plan_digest(plan), True))
         self.assertEqual(result.successful_keys, ("ITEM0001",))
         self.assertEqual(result.unchanged_keys, ("ITEM0002",))
@@ -404,9 +434,8 @@ class PreviewAndExecutionTests(unittest.TestCase):
         plan = self.item_plan()
         approved = plan.actions[0].payload[0]
         fetched = {
-            "ITEM0001": {
+            approved["key"]: {
                 **approved,
-                "key": "ITEM0001",
                 "notes": [{"note": "A personal note"}],
                 "extra": "unrelated field",
             }
@@ -420,10 +449,10 @@ class PreviewAndExecutionTests(unittest.TestCase):
         approved = plan.actions[0].payload[0]
         verified, mismatches = verify_readback(
             plan,
-            {"ITEM0001": {**approved, "key": "ITEM0001", "title": "Changed"}},
+            {approved["key"]: {**approved, "title": "Changed"}},
         )
         self.assertFalse(verified)
-        self.assertIn("ITEM0001.title", mismatches)
+        self.assertIn(f"{approved['key']}.title", mismatches)
 
     def test_verify_readback_checks_codex_note_marker_and_linked_attachment_path(self):
         plan = WritePlan(
@@ -479,7 +508,7 @@ class _HttpOnlyVersionClient:
         self.paths = []
         self.authorization_calls = 0
 
-    def get_json(self, path):
+    def get_json(self, path, query=None):
         self.paths.append(path)
         return {"version": 5}, None
 

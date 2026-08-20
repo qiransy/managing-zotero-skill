@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from hashlib import sha256
 import io
 import json
 from pathlib import Path
@@ -53,7 +54,7 @@ class ZoteroIntegrationTests(unittest.TestCase):
         with FakeZoteroServer(test_mode=True) as server:
             with self.assertRaises(ValueError):
                 ZoteroClient(base_url=server.api_url)
-            plan = build_collection_plan("synthetic-system", server.library_version)
+            plan = build_collection_plan("synthetic-system", server.library_version, server_id=server.server_id)
             result = execute_plan(
                 self.client(server),
                 plan,
@@ -69,6 +70,7 @@ class ZoteroIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 [record.path.split("?", 1)[0] for record in server.records],
                 [
+                    "/api/",
                     "/api/users/0/collections",
                     "/api/",
                     "/api/local/authorize",
@@ -76,10 +78,10 @@ class ZoteroIntegrationTests(unittest.TestCase):
                     "/api/users/0/collections/COL00001",
                 ],
             )
-            self.assertEqual(server.records[2].body, {"appName": "Codex managing-zotero"})
-            self.assertEqual(server.records[3].body, [{"name": "synthetic-system"}])
-            self.assertEqual(server.records[3].headers["If-Unmodified-Since-Version"], "1")
-            self.assertEqual(server.records[3].headers["Zotero-Api-Key"], "[REDACTED]")
+            self.assertEqual(server.records[3].body, {"appName": "Codex managing-zotero"})
+            self.assertEqual(server.records[4].body, [{"name": "synthetic-system"}])
+            self.assertEqual(server.records[4].headers["If-Unmodified-Since-Version"], "1")
+            self.assertEqual(server.records[4].headers["Zotero-Api-Key"], "[REDACTED]")
             self.assertEqual(server.records[0].failure_mode, "")
             self.assertEqual(server.records[-1].object_versions, {"COL00001": 2})
 
@@ -113,7 +115,7 @@ class ZoteroIntegrationTests(unittest.TestCase):
 
     def test_locked_library_is_not_retried_and_exception_is_secret_free(self):
         with FakeZoteroServer(test_mode=True, failure_mode="library_locked") as server:
-            plan = build_collection_plan("synthetic-system", server.library_version)
+            plan = build_collection_plan("synthetic-system", server.library_version, server_id=server.server_id)
             with self.assertRaises(ZoteroLibraryLockedError) as caught:
                 execute_plan(
                     self.client(server),
@@ -126,7 +128,7 @@ class ZoteroIntegrationTests(unittest.TestCase):
 
     def test_412_stale_write_is_not_blindly_retried(self):
         with FakeZoteroServer(test_mode=True, failure_mode="stale_write") as server:
-            plan = build_collection_plan("synthetic-system", server.library_version)
+            plan = build_collection_plan("synthetic-system", server.library_version, server_id=server.server_id)
             with self.assertRaises(ZoteroVersionConflict):
                 execute_plan(
                     self.client(server),
@@ -144,23 +146,23 @@ class ZoteroIntegrationTests(unittest.TestCase):
                 CandidateItem(title="Synthetic paper one", doi="10.0000/synthetic-1"),
                 CandidateItem(title="Synthetic paper two", doi="10.0000/synthetic-2"),
             )
-            plan = build_item_plan(candidates, server.collections["COLLECT01"], ())
+            plan = build_item_plan(candidates, server.collections["COLLECT01"], (), server_id=server.server_id)
             result = execute_plan(
                 self.client(server),
                 plan,
                 ApprovalProof(plan_digest(plan), True),
                 audit_dir=self.temp / "audit",
             )
-            self.assertEqual(result.successful_keys, ("ITEM00001",))
+            self.assertEqual(result.successful_keys, (plan.actions[0].payload[0]["key"],))
             self.assertEqual(result.unchanged_keys, ())
             self.assertEqual(result.failed["1"], "injected item failure")
-            self.assertIn("1.object", result.failed)
+            self.assertNotIn("1.object", result.failed)
             self.assertFalse(result.verified)
             self.assertEqual(server.write_count, 1)
 
     def test_server_id_change_after_preview_stops_before_write(self):
         with FakeZoteroServer(test_mode=True) as server:
-            plan = build_collection_plan("synthetic-system", server.library_version)
+            plan = build_collection_plan("synthetic-system", server.library_version, server_id=server.server_id)
             server.set_failure("server_id_changed_on_authorize")
             with self.assertRaises(ZoteroAuthorizationError):
                 execute_plan(
@@ -190,6 +192,7 @@ class ZoteroIntegrationTests(unittest.TestCase):
                 (CandidateItem(title="Existing synthetic paper", doi="10.0000/reused"),),
                 collection_response["data"],
                 existing,
+                server_id=server.server_id,
             )
             result = execute_plan(
                 client,
@@ -235,7 +238,7 @@ class ZoteroIntegrationTests(unittest.TestCase):
 
     def test_key_is_absent_from_cli_streams_audit_and_persistable_request_records(self):
         with FakeZoteroServer(test_mode=True, failure_mode="library_locked") as server:
-            plan = build_collection_plan("synthetic-system", server.library_version)
+            plan = build_collection_plan("synthetic-system", server.library_version, server_id=server.server_id)
             plan_path = self.temp / "plan.json"
             plan_path.write_text(canonical_json(plan) + "\n", encoding="utf-8")
             code, stdout, stderr = self.run_cli(server, [
@@ -249,6 +252,163 @@ class ZoteroIntegrationTests(unittest.TestCase):
             durable_records = json.dumps([asdict(record) for record in server.records], ensure_ascii=False)
             combined = "\n".join((stdout, stderr, self.audit_text(), durable_records))
             self.assertFalse(server.contains_issued_key(combined))
+
+    @staticmethod
+    def server_fingerprint(server):
+        return sha256(server.server_id.encode("utf-8")).hexdigest()
+
+    def test_apply_rejects_malicious_loaded_plan_payloads_before_authorization(self):
+        malicious_payloads = (
+            {"itemType": "journalArticle", "title": "Synthetic", "deleted": True, "collections": ["COLLECT01"]},
+            {"itemType": "journalArticle", "title": "Synthetic", "unknownMutation": "x", "collections": ["COLLECT01"]},
+            {"itemType": "note", "parentItem": "ITEM00001", "note": "overwrite personal note", "key": "NOTE00001", "version": 1},
+            {"itemType": "journalArticle", "key": "ITEM00001", "collections": ["COLLECT01"], "tags": []},
+            {"itemType": "attachment", "parentItem": "ITEM00001", "linkMode": "linked_file", "path": "C:\\cache\\paper.pdf"},
+        )
+        for index, payload in enumerate(malicious_payloads):
+            with self.subTest(index=index), FakeZoteroServer(test_mode=True) as server:
+                server.seed_collection("COLLECT01", "Synthetic")
+                server.seed_item("ITEM00001", title="Existing", doi="10.0000/existing")
+                plan = {
+                    "operation": "upsert_items",
+                    "collection_key": "COLLECT01",
+                    "collection_name": "Synthetic",
+                    "actions": [{"kind": "upsert_items", "payload": [payload], "item_key": ""}],
+                    "expected_versions": {"COLLECT01": 1},
+                    "library_version": None,
+                    "server_fingerprint": self.server_fingerprint(server),
+                    "duplicate_checks": [],
+                    "allowed_roots": [],
+                }
+                plan_path = self.temp / f"malicious-{index}.json"
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                digest = sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                code, _, _ = self.run_cli(server, [
+                    "apply", "--plan", str(plan_path), "--approval-digest", digest,
+                    "--confirm-user-approved", "--audit-dir", str(self.temp / "audit"),
+                ])
+                self.assertEqual(code, 2)
+                self.assertEqual(server.authorization_count, 0)
+                self.assertEqual(server.write_count, 0)
+
+    def test_preview_digest_is_bound_to_server_identity(self):
+        plan_path = self.temp / "identity-plan.json"
+        with FakeZoteroServer(test_mode=True) as preview_server:
+            code, output, _ = self.run_cli(preview_server, [
+                "preview-collection", "--name", "Synthetic", "--output", str(plan_path),
+            ])
+            self.assertEqual(code, 0, output)
+            digest = json.loads(output)["digest"]
+        with FakeZoteroServer(test_mode=True) as apply_server:
+            apply_server.server_id = "FAKE-SERVER-DIFFERENT"
+            code, _, _ = self.run_cli(apply_server, [
+                "apply", "--plan", str(plan_path), "--approval-digest", digest,
+                "--confirm-user-approved", "--audit-dir", str(self.temp / "audit"),
+            ])
+            self.assertEqual(code, 5)
+            self.assertEqual(apply_server.authorization_count, 0)
+            self.assertEqual(apply_server.write_count, 0)
+
+    def test_preview_items_dedupes_library_wide_blocks_probable_and_rechecks_before_apply(self):
+        with FakeZoteroServer(test_mode=True) as server:
+            server.seed_collection("COLLECT01", "Target", version=2)
+            server.seed_item("ITEM00001", title="Existing DOI", doi="10.0000/reused", collections=("OTHER",), version=3)
+            exact_input = self.temp / "exact.json"
+            exact_input.write_text(json.dumps([{"title": "Candidate title", "doi": "10.0000/reused", "creators": [], "tags": []}]), encoding="utf-8")
+            exact_plan = self.temp / "exact-plan.json"
+            code, _, _ = self.run_cli(server, [
+                "preview-items", "--input", str(exact_input), "--collection-key", "COLLECT01",
+                "--profile", "generic", "--allowed-root", str(self.temp), "--output", str(exact_plan),
+            ])
+            self.assertEqual(code, 0)
+            payload = json.loads(exact_plan.read_text(encoding="utf-8"))["actions"][0]["payload"][0]
+            self.assertEqual(payload["key"], "ITEM00001")
+
+            server.seed_item("ITEM00002", title="Probable paper", doi="", collections=("OTHER",), version=4)
+            server.items["ITEM00002"]["creators"] = [{"lastName": "Smith"}]
+            server.items["ITEM00002"]["date"] = "2025"
+            probable_input = self.temp / "probable.json"
+            probable_input.write_text(json.dumps([{"title": "Probable paper", "year": "2025", "creators": [{"lastName": "Smith"}], "tags": []}]), encoding="utf-8")
+            code, _, _ = self.run_cli(server, [
+                "preview-items", "--input", str(probable_input), "--collection-key", "COLLECT01",
+                "--profile", "generic", "--allowed-root", str(self.temp), "--output", str(self.temp / "probable-plan.json"),
+            ])
+            self.assertEqual(code, 2)
+
+            new_input = self.temp / "new.json"
+            new_input.write_text(json.dumps([{"title": "Concurrent paper", "doi": "10.0000/concurrent", "creators": [], "tags": []}]), encoding="utf-8")
+            new_plan = self.temp / "new-plan.json"
+            code, output, _ = self.run_cli(server, [
+                "preview-items", "--input", str(new_input), "--collection-key", "COLLECT01",
+                "--profile", "generic", "--allowed-root", str(self.temp), "--output", str(new_plan),
+            ])
+            self.assertEqual(code, 0)
+            server.seed_item("ITEM00003", title="Concurrent paper", doi="10.0000/concurrent", collections=("OTHER",), version=5)
+            code, _, _ = self.run_cli(server, [
+                "apply", "--plan", str(new_plan), "--approval-digest", json.loads(output)["digest"],
+                "--confirm-user-approved", "--audit-dir", str(self.temp / "audit"),
+            ])
+            self.assertEqual(code, 5)
+            self.assertEqual(server.authorization_count, 0)
+
+    def test_production_preview_applies_codex_note_attachment_and_r7_evidence_state(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd(), prefix="zotero-final-") as final_dir:
+            final_root = Path(final_dir)
+            pdf = final_root / "synthetic.pdf"
+            pdf.write_bytes(b"%PDF-1.7")
+            with FakeZoteroServer(test_mode=True) as server:
+                server.seed_collection("COLLECT01", "Target", version=2)
+                candidate_path = final_root / "candidate.json"
+                candidate_path.write_text(json.dumps([{
+                    "title": "Synthetic paper", "doi": "10.0000/children",
+                    "evidence_level": "abstract_only", "linked_pdf": str(pdf),
+                    "creators": [],
+                    "tags": ["实验：CP-FTMW"], "note_fields": {"relevance": "摘要支持相关性"},
+                }], ensure_ascii=False), encoding="utf-8")
+                plan_path = final_root / "plan.json"
+                code, output, error = self.run_cli(server, [
+                    "preview-items", "--input", str(candidate_path), "--collection-key", "COLLECT01",
+                    "--profile", "microwave-spectroscopy", "--allowed-root", str(final_root), "--output", str(plan_path),
+                ])
+                self.assertEqual(code, 0, error)
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                payloads = plan["actions"][0]["payload"]
+                self.assertEqual([value["itemType"] for value in payloads], ["journalArticle", "note", "attachment"])
+                self.assertIn('data-codex-note="evidence-bounded-v1"', payloads[1]["note"])
+                self.assertNotIn("状态：待获取全文", [tag["tag"] for tag in payloads[0]["tags"]])
+                code, _, error = self.run_cli(server, [
+                    "apply", "--plan", str(plan_path), "--approval-digest", json.loads(output)["digest"],
+                    "--confirm-user-approved", "--audit-dir", str(final_root / "audit"),
+                ])
+                self.assertEqual(code, 0, error)
+                parent = payloads[0]["key"]
+                self.assertEqual([child["itemType"] for child in server.children[parent]], ["note", "attachment"])
+
+    def test_first_item_failure_preserves_index_mapping_and_cli_emits_partial_json(self):
+        with FakeZoteroServer(test_mode=True, failure_mode="first_item_failure") as server:
+            server.seed_collection("COLLECT01", "Target", version=2)
+            candidates = self.temp / "partial.json"
+            candidates.write_text(json.dumps([
+                {"title": "First", "doi": "10.0000/first", "creators": [], "tags": []},
+                {"title": "Second", "doi": "10.0000/second", "creators": [], "tags": []},
+            ]), encoding="utf-8")
+            plan_path = self.temp / "partial-plan.json"
+            code, output, error = self.run_cli(server, [
+                "preview-items", "--input", str(candidates), "--collection-key", "COLLECT01",
+                "--profile", "generic", "--allowed-root", str(self.temp), "--output", str(plan_path),
+            ])
+            self.assertEqual(code, 0, error)
+            digest = json.loads(output)["digest"]
+            planned_payloads = json.loads(plan_path.read_text(encoding="utf-8"))["actions"][0]["payload"]
+            code, output, error = self.run_cli(server, [
+                "apply", "--plan", str(plan_path), "--approval-digest", digest,
+                "--confirm-user-approved", "--audit-dir", str(self.temp / "audit"),
+            ])
+            self.assertEqual(code, 6)
+            partial = json.loads(output)
+            self.assertEqual(partial["successful_keys"], [planned_payloads[2]["key"], planned_payloads[3]["key"]])
+            self.assertEqual(partial["failed"]["0"], "injected first-item failure")
+            self.assertNotIn("2.title", partial["failed"])
 
 
 if __name__ == "__main__":
