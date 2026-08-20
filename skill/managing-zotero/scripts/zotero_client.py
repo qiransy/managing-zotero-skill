@@ -100,11 +100,14 @@ class ZoteroClient:
         base_url: str = "http://127.0.0.1:23119/api/",
         transport: Any | None = None,
         timeout: float = 10.0,
+        *,
+        test_mode: bool = False,
     ) -> None:
         parsed = urllib.parse.urlparse(base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Zotero base URL must use loopback HTTP")
-        if parsed.port != 23119:
+        alternate_test_port = test_mode is True and parsed.hostname == "127.0.0.1" and parsed.port is not None
+        if parsed.port != 23119 and not alternate_test_port:
             raise ValueError("Zotero local API port must be 23119")
         normalized_path = parsed.path.rstrip("/")
         if normalized_path != "/api":
