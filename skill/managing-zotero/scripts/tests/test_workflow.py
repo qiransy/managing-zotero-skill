@@ -98,6 +98,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("1234.567", note)
         self.assertNotIn("abstract assignment", note)
 
+    def test_abstract_only_redacts_prohibited_content_from_all_rendered_source_paths(self):
+        prohibited_text = 'A = 1234.567 MHz "quoted" p. 4'
+        source_cases = (
+            {"abstract": prohibited_text},
+            {"tags": ("实验：" + prohibited_text,)},
+            {"note_fields": {"relevance": prohibited_text}},
+            {"note_fields": {"experiment": prohibited_text}},
+            {"note_fields": {"structure": prohibited_text}},
+            {"note_fields": {"theory_and_assignment": prohibited_text}},
+            {"note_fields": {"use_and_limits": prohibited_text}},
+        )
+        for source in source_cases:
+            with self.subTest(source=source):
+                note = render_note(
+                    CandidateItem(
+                        title="A paper",
+                        evidence_level=EvidenceLevel.ABSTRACT_ONLY,
+                        **source,
+                    ),
+                    "microwave-spectroscopy",
+                )
+                for prohibited in ("1234.567", "quoted", "p. 4"):
+                    self.assertNotIn(prohibited, note)
+
+    def test_status_tag_is_canonical_from_evidence_level_not_caller_input(self):
+        cases = (
+            (EvidenceLevel.ABSTRACT_ONLY, "状态：深度精读", "状态：待获取全文"),
+            (EvidenceLevel.FULL_TEXT_VERIFIED, "状态：深度精读", "状态：全文已核查"),
+            (EvidenceLevel.DEEP_READ, "状态：全文已核查", "状态：深度精读"),
+        )
+        for evidence_level, supplied, expected in cases:
+            with self.subTest(evidence_level=evidence_level):
+                tags = sanitize_tags(
+                    CandidateItem(title="A paper", evidence_level=evidence_level, tags=(supplied,)),
+                    "microwave-spectroscopy",
+                )
+                self.assertEqual(tags, (expected,))
+
+    def test_generic_note_does_not_consume_microwave_experiment_tag(self):
+        candidate = CandidateItem(title="A paper", tags=("实验：CP-FTMW",))
+        note = render_note(candidate, "generic")
+        self.assertNotIn("实验：CP-FTMW", note)
+        self.assertNotIn("CP-FTMW", note)
+
     def test_item_payload_has_bibliographic_data_without_overwriting_notes(self):
         candidate = CandidateItem(
             title="A paper",
