@@ -371,6 +371,8 @@ def _validate_item_payload(plan: WritePlan, payload: Mapping[str, Any]) -> None:
     if item_type == "note":
         if not set(payload).issubset(_NOTE_FIELDS) or _CODEX_NOTE_MARKER not in str(payload.get("note", "")):
             raise ValueError("only stable-marker Codex notes may be created or updated")
+        if version != 0:
+            raise ValueError("existing Zotero notes cannot be updated by this version")
         if not str(payload.get("parentItem", "")):
             raise ValueError("Codex notes require a parent item")
         return

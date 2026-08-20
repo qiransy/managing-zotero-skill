@@ -68,3 +68,13 @@ OK
 - Additional explicit key discard/zeroization beyond the existing one-time consume-and-clear behavior.
 
 No Critical or Important review finding remains open in this pass.
+
+## Scoped personal-note re-review fix
+
+A scoped re-review found that a loaded plan could target an existing personal-note key/version if the replacement HTML itself contained the Codex marker. A new synthetic regression seeded an unmarked personal note, then attempted a marked replacement at the same key. Before the fix, apply returned success and overwrote the note (`expected 2, got 0`).
+
+The first version now permits only new stable-marker Codex notes with `version == 0`; all existing-note updates are rejected before authorization. This is the conservative branch because the current plan validator does not independently prove that an existing note was originally Codex-owned.
+
+- Focused GREEN: `Ran 1 test in 0.538s; OK`.
+- Fresh full suite: `Ran 88 tests in 14.786s; OK`.
+- The seeded personal note remained unchanged; authorization and write counts remained zero.
