@@ -5,12 +5,20 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from zotero_models import CandidateItem, EvidenceLevel
+from zotero_models import CandidateItem, EvidenceLevel, OperationKind, WriteAction, WritePlan, plan_digest
 from zotero_workflow import (
+    ApprovalProof,
+    ApprovalRequired,
+    BatchLimitExceeded,
+    PreviewStale,
+    build_collection_plan,
+    build_item_plan,
     build_linked_attachment,
     candidate_to_zotero_item,
+    execute_plan,
     render_note,
     sanitize_tags,
+    verify_readback,
 )
 
 
@@ -246,6 +254,205 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(payload["collections"], ["COLLECT01"])
         self.assertEqual(payload["tags"], [{"tag": "实验：CP-FTMW"}, {"tag": "状态：待获取全文"}])
         self.assertNotIn("notes", payload)
+
+
+class PreviewAndExecutionTests(unittest.TestCase):
+    """Approval-bound write behavior, using only an in-memory local API fake."""
+
+    def setUp(self):
+        self.client = _FakeWorkflowClient()
+        self.collection = {"key": "COLLECT01", "version": 4}
+
+    def candidates(self, count=1):
+        return tuple(
+            CandidateItem(title=f"Paper {number}", doi=f"10.1000/{number}")
+            for number in range(count)
+        )
+
+    def item_plan(self, expected_versions=None):
+        plan = build_item_plan(self.candidates(), self.collection, [])
+        if expected_versions is None:
+            return plan
+        return WritePlan(
+            operation=plan.operation,
+            collection_key=plan.collection_key,
+            collection_name=plan.collection_name,
+            actions=plan.actions,
+            expected_versions=expected_versions,
+            library_version=plan.library_version,
+        )
+
+    def test_execute_refuses_missing_user_confirmation(self):
+        plan = self.item_plan()
+        proof = ApprovalProof(digest=plan_digest(plan), user_confirmed=False)
+        with self.assertRaises(ApprovalRequired):
+            execute_plan(self.client, plan, proof)
+        self.assertEqual(self.client.authorization_calls, 0)
+        self.assertEqual(self.client.write_calls, 0)
+
+    def test_execute_refuses_changed_preview_digest(self):
+        plan = self.item_plan()
+        with self.assertRaises(ApprovalRequired):
+            execute_plan(self.client, plan, ApprovalProof("0" * 64, True))
+        self.assertEqual(self.client.write_calls, 0)
+
+    def test_version_change_stops_before_authorization(self):
+        plan = self.item_plan(expected_versions={"ITEM0001": 7})
+        self.client.current_versions = {"ITEM0001": 8}
+        with self.assertRaises(PreviewStale):
+            execute_plan(self.client, plan, ApprovalProof(plan_digest(plan), True))
+        self.assertEqual(self.client.authorization_calls, 0)
+
+    def test_collection_version_is_reread_from_the_collection_endpoint(self):
+        plan = self.item_plan()
+        client = _HttpOnlyVersionClient()
+        with self.assertRaises(PreviewStale):
+            execute_plan(client, plan, ApprovalProof(plan_digest(plan), True))
+        self.assertEqual(client.paths, ["users/0/collections/COLLECT01"])
+        self.assertEqual(client.authorization_calls, 0)
+
+    def test_item_plan_rejects_eleven_papers(self):
+        with self.assertRaises(BatchLimitExceeded):
+            build_item_plan(self.candidates(11), self.collection, [])
+
+    def test_exact_duplicate_reuses_item_without_clearing_tags_or_other_collections(self):
+        existing = [{
+            "key": "ITEM0001",
+            "version": 7,
+            "data": {"DOI": "10.1000/0", "collections": ["OTHER001"], "tags": [{"tag": "personal"}]},
+        }]
+        plan = build_item_plan(self.candidates(), self.collection, existing)
+        payload = plan.actions[0].payload[0]
+        self.assertEqual(payload["key"], "ITEM0001")
+        self.assertEqual(payload["collections"], ["OTHER001", "COLLECT01"])
+        self.assertNotIn("tags", payload)
+
+    def test_collection_creation_and_item_upsert_cannot_share_a_plan(self):
+        with self.assertRaises(ValueError):
+            WritePlan(
+                operation=OperationKind.UPSERT_ITEMS,
+                collection_key="COLLECT01",
+                collection_name="Research",
+                actions=(
+                    WriteAction("create_collection", {"name": "Research"}),
+                    WriteAction("upsert_items", []),
+                ),
+                expected_versions={},
+            )
+
+    def test_collection_plan_contains_one_collection_action(self):
+        plan = build_collection_plan("Research", library_version=9)
+        self.assertEqual(plan.operation, OperationKind.CREATE_COLLECTION)
+        self.assertEqual(tuple(action.kind for action in plan.actions), ("create_collection",))
+        self.assertEqual(plan.library_version, 9)
+
+    def test_collection_readback_reports_a_changed_approved_name(self):
+        plan = build_collection_plan("Research", library_version=9)
+        verified, mismatches = verify_readback(plan, {"COLLECT01": {"name": "Changed"}})
+        self.assertFalse(verified)
+        self.assertIn("COLLECT01.name", mismatches)
+
+    def test_partial_write_reports_success_unchanged_and_failed_without_retry(self):
+        plan = self.item_plan()
+        self.client.write_response = {
+            "successful": {"0": "ITEM0001"},
+            "unchanged": {"1": "ITEM0002"},
+            "failed": {"2": {"message": "invalid item"}},
+        }
+        self.client.fetched_objects = {"ITEM0001": plan.actions[0].payload[0]}
+        result = execute_plan(self.client, plan, ApprovalProof(plan_digest(plan), True))
+        self.assertEqual(result.successful_keys, ("ITEM0001",))
+        self.assertEqual(result.unchanged_keys, ("ITEM0002",))
+        self.assertEqual(result.failed, {"2": "invalid item"})
+        self.assertEqual(self.client.write_calls, 1)
+        self.assertFalse(result.verified)
+
+    def test_verify_readback_accepts_approved_fields_and_ignores_personal_note(self):
+        plan = self.item_plan()
+        approved = plan.actions[0].payload[0]
+        fetched = {
+            "ITEM0001": {
+                **approved,
+                "key": "ITEM0001",
+                "notes": [{"note": "A personal note"}],
+                "extra": "unrelated field",
+            }
+        }
+        verified, mismatches = verify_readback(plan, fetched)
+        self.assertTrue(verified)
+        self.assertEqual(mismatches, {})
+
+    def test_verify_readback_reports_changed_approved_title(self):
+        plan = self.item_plan()
+        approved = plan.actions[0].payload[0]
+        verified, mismatches = verify_readback(
+            plan,
+            {"ITEM0001": {**approved, "key": "ITEM0001", "title": "Changed"}},
+        )
+        self.assertFalse(verified)
+        self.assertIn("ITEM0001.title", mismatches)
+
+    def test_verify_readback_checks_codex_note_marker_and_linked_attachment_path(self):
+        plan = WritePlan(
+            operation=OperationKind.UPSERT_ITEMS,
+            collection_key="COLLECT01",
+            collection_name="Research",
+            actions=(WriteAction("upsert_items", (
+                {"itemType": "journalArticle", "key": "ITEM0001", "title": "Paper", "DOI": "10.1000/0", "collections": ["COLLECT01"], "tags": []},
+                {"itemType": "note", "key": "NOTE0001", "parentItem": "ITEM0001", "note": '<div data-codex-note="evidence-bounded-v1">Codex</div>'},
+                {"itemType": "attachment", "key": "ATTACH01", "parentItem": "ITEM0001", "linkMode": "linked_file", "path": "D:\\library\\paper.pdf"},
+            )),),
+            expected_versions={},
+        )
+        verified, mismatches = verify_readback(plan, {
+            "ITEM0001": {"title": "Paper", "DOI": "10.1000/0", "collections": ["COLLECT01"], "tags": []},
+            "NOTE0001": {"note": "missing marker"},
+            "ATTACH01": {"path": "D:\\library\\other.pdf"},
+        })
+        self.assertFalse(verified)
+        self.assertIn("NOTE0001.child_note", mismatches)
+        self.assertIn("ATTACH01.attachment_path", mismatches)
+
+
+class _FakeWorkflowClient:
+    def __init__(self):
+        self.authorization_calls = 0
+        self.write_calls = 0
+        self.discard_calls = 0
+        self.current_versions = {"COLLECT01": 4}
+        self.write_response = {"successful": {"0": "ITEM0001"}, "unchanged": {}, "failed": {}}
+        self.fetched_objects = {"ITEM0001": {"title": "Paper 0", "DOI": "10.1000/0", "collections": ["COLLECT01"], "tags": []}}
+
+    def get_versions(self, keys):
+        return {key: self.current_versions.get(key) for key in keys}
+
+    def authorize_once(self):
+        self.authorization_calls += 1
+        return object()
+
+    def discard_authorization(self, authorization):
+        self.discard_calls += 1
+
+    def post_json(self, path, payload, authorization, expected_version=None):
+        self.write_calls += 1
+        return self.write_response, None
+
+    def fetch_objects(self, keys):
+        return {key: self.fetched_objects[key] for key in keys if key in self.fetched_objects}
+
+
+class _HttpOnlyVersionClient:
+    def __init__(self):
+        self.paths = []
+        self.authorization_calls = 0
+
+    def get_json(self, path):
+        self.paths.append(path)
+        return {"version": 5}, None
+
+    def authorize_once(self):
+        self.authorization_calls += 1
+        return object()
 
 
 if __name__ == "__main__":
