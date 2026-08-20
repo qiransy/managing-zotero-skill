@@ -66,11 +66,20 @@ class WritePlan:
     expected_versions: Mapping[str, int]
     library_version: int | None = None
 
+    def __post_init__(self) -> None:
+        action_kinds = tuple(action.kind for action in self.actions)
+        if {
+            OperationKind.CREATE_COLLECTION.value,
+            OperationKind.UPSERT_ITEMS.value,
+        }.issubset(action_kinds):
+            raise ValueError("collection creation and item upsert require separate WritePlans")
+
 
 @dataclass(frozen=True)
 class ExecutionResult:
     plan_digest: str
     successful_keys: tuple[str, ...] = ()
+    unchanged_keys: tuple[str, ...] = ()
     failed: Mapping[str, str] = field(default_factory=dict)
     verified: bool = False
 

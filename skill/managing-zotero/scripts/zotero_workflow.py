@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 import re
-from typing import Any, Mapping
+import secrets
+from typing import Any, Iterable, Mapping
 
-from zotero_models import CandidateItem, EvidenceLevel
+from zotero_dedupe import classify_duplicate
+from zotero_models import (
+    CandidateItem,
+    EvidenceLevel,
+    ExecutionResult,
+    MatchKind,
+    OperationKind,
+    WriteAction,
+    WritePlan,
+    plan_digest,
+)
 
 
 _MICROWAVE_PROFILE = "microwave-spectroscopy"
@@ -25,6 +37,372 @@ _UNVERIFIED_CLAIM = re.compile(
     re.IGNORECASE,
 )
 _TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "assets" / "zotero-brief-note-template.html"
+_MAX_PAPERS_PER_BATCH = 10
+
+
+class ApprovalRequired(RuntimeError):
+    """A user did not explicitly approve the exact preview being applied."""
+
+
+class PreviewStale(RuntimeError):
+    """A version changed after preview and before authorization."""
+
+
+class BatchLimitExceeded(ValueError):
+    """A plan exceeds the conservative first-version batch boundary."""
+
+
+@dataclass(frozen=True)
+class ApprovalProof:
+    digest: str
+    user_confirmed: bool
+
+
+def build_collection_plan(name: str, library_version: int) -> WritePlan:
+    """Build the separately-approved, single-collection creation preview."""
+    collection_name = str(name).strip()
+    if not collection_name:
+        raise ValueError("collection name is required")
+    if not isinstance(library_version, int) or library_version < 0:
+        raise ValueError("library_version must be a non-negative integer")
+    return WritePlan(
+        operation=OperationKind.CREATE_COLLECTION,
+        collection_key="",
+        collection_name=collection_name,
+        actions=(WriteAction("create_collection", {"name": collection_name}),),
+        expected_versions={},
+        library_version=library_version,
+    )
+
+
+def build_item_plan(
+    candidates: Iterable[CandidateItem],
+    collection: Mapping[str, Any],
+    existing_items: Iterable[Mapping[str, Any]],
+) -> WritePlan:
+    """Build one bounded item-upsert preview for an already-existing Collection."""
+    candidate_list = tuple(candidates)
+    if len(candidate_list) > _MAX_PAPERS_PER_BATCH:
+        raise BatchLimitExceeded("an item plan may contain at most 10 candidate papers")
+    collection_key = str(collection.get("key", ""))
+    if not collection_key:
+        raise ValueError("an item plan requires an existing collection key")
+    existing = tuple(existing_items)
+    expected_versions: dict[str, int] = {}
+    collection_version = _object_version(collection)
+    if collection_version is not None:
+        expected_versions[collection_key] = collection_version
+    payloads: list[dict[str, Any]] = []
+    for candidate in candidate_list:
+        if not isinstance(candidate, CandidateItem):
+            raise TypeError("candidates must be CandidateItem instances")
+        payload = candidate_to_zotero_item(candidate, collection_key, _GENERIC_PROFILE)
+        duplicate = classify_duplicate(candidate, existing)
+        if duplicate.kind == MatchKind.EXACT_IDENTIFIER and duplicate.item_key:
+            matched = next((item for item in existing if str(item.get("key", "")) == duplicate.item_key), {})
+            existing_data = _object_data(matched)
+            version = _object_version(matched)
+            if version is not None:
+                expected_versions[duplicate.item_key] = version
+                payload["version"] = version
+            payload["key"] = duplicate.item_key
+            existing_collections = [str(key) for key in existing_data.get("collections", ())]
+            payload["collections"] = list(dict.fromkeys((*existing_collections, collection_key)))
+            payload.pop("tags", None)
+        payloads.append(payload)
+    return WritePlan(
+        operation=OperationKind.UPSERT_ITEMS,
+        collection_key=collection_key,
+        collection_name=str(collection.get("name", "")),
+        actions=(WriteAction("upsert_items", tuple(payloads)),),
+        expected_versions=expected_versions,
+        library_version=None,
+    )
+
+
+def execute_plan(
+    client: Any,
+    plan: WritePlan,
+    proof: ApprovalProof,
+    audit_dir: str | Path | None = None,
+) -> ExecutionResult:
+    """Apply exactly one reviewed request, then return its verified actual state.
+
+    ``audit_dir`` is intentionally unused until the append-only audit component is
+    introduced; accepting it keeps the approval boundary stable without writing an
+    unaudited side channel here.
+    """
+    del audit_dir
+    _validate_plan(plan)
+    if not proof.user_confirmed:
+        raise ApprovalRequired("explicit user confirmation is required")
+    calculated_digest = plan_digest(plan)
+    if (
+        not isinstance(proof.digest, str)
+        or len(proof.digest) != 64
+        or not secrets.compare_digest(calculated_digest, proof.digest)
+    ):
+        raise ApprovalRequired("the approved preview digest does not match this plan")
+    _ensure_versions_unchanged(client, plan)
+
+    authorization = client.authorize_once()
+    try:
+        response, _ = client.post_json(
+            _write_path(plan),
+            _write_payload(plan),
+            authorization,
+            expected_version=plan.library_version,
+        )
+    finally:
+        discard = getattr(client, "discard_authorization", None)
+        if callable(discard):
+            discard(authorization)
+
+    successful, unchanged, failed = _parse_write_response(response, plan)
+    affected_keys = tuple(dict.fromkeys((*successful, *unchanged)))
+    fetched = _fetch_objects(client, plan, affected_keys)
+    readback_ok, mismatches = verify_readback(plan, fetched)
+    if failed:
+        readback_ok = False
+    return ExecutionResult(
+        plan_digest=calculated_digest,
+        successful_keys=successful,
+        unchanged_keys=unchanged,
+        failed=failed | mismatches,
+        verified=readback_ok,
+    )
+
+
+def verify_readback(plan: WritePlan, fetched_objects: Mapping[str, Any]) -> tuple[bool, dict[str, str]]:
+    """Compare only approved fields, leaving user-owned fields deliberately free."""
+    mismatches: dict[str, str] = {}
+    if plan.operation == OperationKind.CREATE_COLLECTION:
+        expected_name = str(plan.actions[0].payload.get("name", ""))
+        for key, value in fetched_objects.items():
+            actual = _object_data(value)
+            if actual.get("name") != expected_name:
+                mismatches[f"{key}.name"] = "approved collection name differs from read-back"
+        if not fetched_objects:
+            mismatches["collection.object"] = "collection was not returned by read-back"
+        return not mismatches, mismatches
+    expected_items = _approved_payloads(plan)
+    fetched_by_key = {str(key): _object_data(value) for key, value in fetched_objects.items()}
+    used_keys: set[str] = set()
+    for position, expected in enumerate(expected_items):
+        key = str(expected.get("key", ""))
+        if key:
+            actual = fetched_by_key.get(key)
+        else:
+            remaining = ((candidate_key, value) for candidate_key, value in fetched_by_key.items() if candidate_key not in used_keys)
+            key, actual = next(remaining, ("", None))
+        label = key or str(position)
+        if not isinstance(actual, Mapping):
+            mismatches[f"{label}.object"] = "object was not returned by read-back"
+            continue
+        used_keys.add(key)
+        _compare_item_fields(expected, actual, label, mismatches)
+    return not mismatches, mismatches
+
+
+def _validate_plan(plan: WritePlan) -> None:
+    action_kinds = tuple(action.kind for action in plan.actions)
+    if plan.operation == OperationKind.CREATE_COLLECTION:
+        if action_kinds != ("create_collection",):
+            raise ValueError("a collection plan must contain exactly one collection creation")
+    elif plan.operation == OperationKind.UPSERT_ITEMS:
+        if action_kinds != ("upsert_items",) or not plan.collection_key:
+            raise ValueError("an item plan must target one existing collection")
+        if len(_item_payloads(plan)) > _MAX_PAPERS_PER_BATCH:
+            raise BatchLimitExceeded("an item plan may contain at most 10 candidate papers")
+    else:
+        raise ValueError("unknown write plan operation")
+
+
+def _ensure_versions_unchanged(client: Any, plan: WritePlan) -> None:
+    if plan.expected_versions:
+        keys = tuple(plan.expected_versions)
+        get_versions = getattr(client, "get_versions", None)
+        if callable(get_versions):
+            current_versions = get_versions(keys)
+        else:
+            current_versions = _read_versions_with_client(client, plan, keys)
+        for key, expected in plan.expected_versions.items():
+            if not isinstance(current_versions, Mapping) or current_versions.get(key) != expected:
+                raise PreviewStale(f"preview is stale for {key}")
+    if plan.library_version is not None:
+        current_library_version = _read_library_version(client)
+        if current_library_version != plan.library_version:
+            raise PreviewStale("preview is stale for the Zotero library")
+
+
+def _read_versions_with_client(client: Any, plan: WritePlan, keys: tuple[str, ...]) -> Mapping[str, int | None]:
+    get_json = getattr(client, "get_json", None)
+    if not callable(get_json):
+        raise PreviewStale("client cannot re-read object versions")
+    versions: dict[str, int | None] = {}
+    for key in keys:
+        resource = "collections" if key == plan.collection_key else "items"
+        payload, response = get_json(f"users/0/{resource}/{key}")
+        versions[key] = _object_version(payload)
+        if versions[key] is None:
+            versions[key] = _header_version(response)
+    return versions
+
+
+def _read_library_version(client: Any) -> int | None:
+    get_library_version = getattr(client, "get_library_version", None)
+    if callable(get_library_version):
+        return get_library_version()
+    get_json = getattr(client, "get_json", None)
+    if not callable(get_json):
+        raise PreviewStale("client cannot re-read the library version")
+    _, response = get_json("users/0/collections")
+    return _header_version(response)
+
+
+def _write_path(plan: WritePlan) -> str:
+    return "users/0/collections" if plan.operation == OperationKind.CREATE_COLLECTION else "users/0/items"
+
+
+def _write_payload(plan: WritePlan) -> object:
+    return plan.actions[0].payload
+
+
+def _parse_write_response(response: Any, plan: WritePlan) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str]]:
+    if not isinstance(response, Mapping):
+        return (), (), {"response": "Zotero returned an invalid multi-write response"}
+    payloads = _approved_payloads(plan)
+    successful = _response_keys(response.get("successful"), payloads)
+    unchanged = _response_keys(response.get("unchanged"), payloads)
+    failed = _failure_reasons(response.get("failed"))
+    return successful, unchanged, failed
+
+
+def _response_keys(group: Any, payloads: tuple[Mapping[str, Any], ...]) -> tuple[str, ...]:
+    if not isinstance(group, Mapping):
+        return ()
+    keys: list[str] = []
+    for raw_index, value in group.items():
+        key = ""
+        if isinstance(value, Mapping):
+            key = str(value.get("key", ""))
+        elif isinstance(value, str):
+            key = value
+        if not key:
+            try:
+                key = str(payloads[int(raw_index)].get("key", ""))
+            except (IndexError, TypeError, ValueError):
+                key = ""
+        if key:
+            keys.append(key)
+    return tuple(keys)
+
+
+def _failure_reasons(group: Any) -> dict[str, str]:
+    if not isinstance(group, Mapping):
+        return {}
+    reasons: dict[str, str] = {}
+    for index, detail in group.items():
+        if isinstance(detail, Mapping):
+            reasons[str(index)] = str(detail.get("message") or detail.get("code") or "write failed")
+        else:
+            reasons[str(index)] = str(detail)
+    return reasons
+
+
+def _fetch_objects(client: Any, plan: WritePlan, keys: tuple[str, ...]) -> Mapping[str, Any]:
+    if not keys:
+        return {}
+    fetch_objects = getattr(client, "fetch_objects", None)
+    if callable(fetch_objects):
+        result = fetch_objects(keys)
+        return result if isinstance(result, Mapping) else {}
+    get_json = getattr(client, "get_json", None)
+    if not callable(get_json):
+        return {}
+    fetched: dict[str, Any] = {}
+    resource = "collections" if plan.operation == OperationKind.CREATE_COLLECTION else "items"
+    for key in keys:
+        payload, _ = get_json(f"users/0/{resource}/{key}")
+        fetched[key] = payload
+    return fetched
+
+
+def _item_payloads(plan: WritePlan) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        item
+        for item in _approved_payloads(plan)
+        if item.get("itemType") not in {"note", "attachment"}
+    )
+
+
+def _approved_payloads(plan: WritePlan) -> tuple[Mapping[str, Any], ...]:
+    if plan.operation != OperationKind.UPSERT_ITEMS or not plan.actions:
+        return ()
+    payload = plan.actions[0].payload
+    if isinstance(payload, Mapping):
+        return (payload,)
+    if isinstance(payload, (list, tuple)):
+        return tuple(item for item in payload if isinstance(item, Mapping))
+    return ()
+
+
+def _compare_item_fields(expected: Mapping[str, Any], actual: Mapping[str, Any], label: str, mismatches: dict[str, str]) -> None:
+    for field in ("title", "DOI"):
+        if field in expected and actual.get(field) != expected[field]:
+            mismatches[f"{label}.{field}"] = "approved value differs from read-back"
+    if "collections" in expected:
+        expected_collections = set(map(str, expected["collections"]))
+        actual_collections = set(map(str, actual.get("collections", ())))
+        if not expected_collections.issubset(actual_collections):
+            mismatches[f"{label}.collections"] = "approved collection membership is absent"
+    if "tags" in expected:
+        expected_tags = _tag_names(expected["tags"])
+        actual_tags = _tag_names(actual.get("tags", ()))
+        if not expected_tags.issubset(actual_tags):
+            mismatches[f"{label}.tags"] = "approved tag is absent"
+    if expected.get("itemType") == "note" and "data-codex-note=" in str(expected.get("note", "")):
+        marker = re.search(r'data-codex-note="[^"]+"', str(expected["note"]))
+        if marker is None or marker.group(0) not in str(actual.get("note", "")):
+            mismatches[f"{label}.child_note"] = "approved Codex child-note marker is absent"
+    if expected.get("itemType") == "attachment" and "path" in expected:
+        if actual.get("path") != expected["path"]:
+            mismatches[f"{label}.attachment_path"] = "approved linked attachment path differs"
+
+
+def _tag_names(tags: Any) -> set[str]:
+    if not isinstance(tags, (list, tuple)):
+        return set()
+    return {str(tag.get("tag", "")) if isinstance(tag, Mapping) else str(tag) for tag in tags}
+
+
+def _object_data(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    data = value.get("data")
+    return data if isinstance(data, Mapping) else value
+
+
+def _object_version(value: Any) -> int | None:
+    if not isinstance(value, Mapping):
+        return None
+    for source in (value, value.get("data", {})):
+        if isinstance(source, Mapping) and isinstance(source.get("version"), int):
+            return source["version"]
+    return None
+
+
+def _header_version(response: Any) -> int | None:
+    headers = getattr(response, "headers", {})
+    if not isinstance(headers, Mapping):
+        return None
+    for name, value in headers.items():
+        if str(name).casefold() == "last-modified-version":
+            try:
+                return int(str(value))
+            except ValueError:
+                return None
+    return None
 
 
 def sanitize_tags(candidate: CandidateItem, profile_name: str) -> tuple[str, ...]:
