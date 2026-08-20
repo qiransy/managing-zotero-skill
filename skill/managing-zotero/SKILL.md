@@ -41,7 +41,7 @@ Use one of two entry modes. For Codex-found literature, collect only verified ca
 
 ## Discover and classify without writing
 
-Use `collections --query`, `items --doi`, or `items --query` for the narrow target. Treat an exact DOI match as a reuse candidate, not permission to duplicate, replace, merge, or overwrite. For incomplete records, classify the result conservatively as `new`, `reused`, or `conflicted`; report the reason and ask for a decision for each conflict. Preserve all personal notes. Create only a separate Codex child note bearing the stable `data-codex-note` marker; never alter an unmarked personal note.
+Use `collections --query`, `items --doi`, or `items --query` for the narrow target. Treat an exact DOI match as a reuse candidate, not permission to duplicate, replace, merge, or overwrite. For incomplete records, classify the result conservatively as `new`, `reused`, or `conflicted`; report the reason and ask for a decision for each conflict. Preserve all personal notes. Create only a separate Codex child note bearing the exact stable marker `data-codex-note="evidence-bounded-v1"`; never alter an unmarked personal note.
 
 ```powershell
 & 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' "$SKILL_DIR\scripts\zotero_local.py" items --doi '10.0000/example'

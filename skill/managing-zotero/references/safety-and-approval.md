@@ -11,7 +11,7 @@ Candidates: 10 total | new: 7 | reused: 2 | conflicted: 1
 Conflicts: DOI 10.0000/example is an existing candidate; no duplicate, merge, or overwrite is proposed.
 Full-text state: 6 状态：全文已核查; 4 状态：待获取全文 (abstract/metadata only)
 Proposed tags: generic profile: no domain-specific tags
-Proposed Codex child note: data-codex-note="managing-zotero:v1"; existing personal notes: preserved and excluded
+Proposed Codex child note: data-codex-note="evidence-bounded-v1"; existing personal notes: preserved and excluded
 Proposed linked PDFs: D:\research\approved-pdfs\paper-01.pdf and D:\research\approved-pdfs\paper-02.pdf only
 Plan digest: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 Overwrite risk: none; conflicts remain unchanged pending a later user decision
