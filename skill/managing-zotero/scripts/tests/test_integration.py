@@ -291,6 +291,50 @@ class ZoteroIntegrationTests(unittest.TestCase):
                 self.assertEqual(server.authorization_count, 0)
                 self.assertEqual(server.write_count, 0)
 
+    def test_marked_note_cannot_target_an_existing_personal_note(self):
+        with FakeZoteroServer(test_mode=True) as server:
+            server.seed_collection("COLLECT01", "Synthetic", version=1)
+            server.seed_item(
+                "ITEM00001",
+                title="Existing",
+                doi="10.0000/existing",
+                version=1,
+                personal_note="User-owned personal note",
+            )
+            note_key = "NOTE-ITEM00001"
+            plan = {
+                "operation": "upsert_items",
+                "collection_key": "COLLECT01",
+                "collection_name": "Synthetic",
+                "actions": [{
+                    "kind": "upsert_items",
+                    "payload": [{
+                        "itemType": "note",
+                        "key": note_key,
+                        "version": 1,
+                        "parentItem": "ITEM00001",
+                        "note": '<div data-codex-note="evidence-bounded-v1">replace</div>',
+                    }],
+                    "item_key": "",
+                }],
+                "expected_versions": {"COLLECT01": 1, note_key: 1},
+                "library_version": None,
+                "server_fingerprint": self.server_fingerprint(server),
+                "duplicate_checks": [],
+                "allowed_roots": [],
+            }
+            plan_path = self.temp / "marked-note-overwrite.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            digest = sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            code, _, _ = self.run_cli(server, [
+                "apply", "--plan", str(plan_path), "--approval-digest", digest,
+                "--confirm-user-approved", "--audit-dir", str(self.temp / "audit"),
+            ])
+            self.assertEqual(code, 2)
+            self.assertEqual(server.authorization_count, 0)
+            self.assertEqual(server.write_count, 0)
+            self.assertEqual(server.children["ITEM00001"][0]["note"], "User-owned personal note")
+
     def test_preview_digest_is_bound_to_server_identity(self):
         plan_path = self.temp / "identity-plan.json"
         with FakeZoteroServer(test_mode=True) as preview_server:
