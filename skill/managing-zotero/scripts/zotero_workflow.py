@@ -17,7 +17,8 @@ _FULL_TEXT_LEVELS = frozenset((EvidenceLevel.FULL_TEXT_VERIFIED, EvidenceLevel.D
 _UNVERIFIED_FIELD_TOKENS = ("constant", "quotation", "quote", "page")
 _UNVERIFIED_SAFE_FIELDS = frozenset(("relevance", "experiment", "structure", "theory_and_assignment", "use_and_limits"))
 _UNVERIFIED_CLAIM = re.compile(
-    r"(?:\b(?:[A-Za-zµμ][\wµμ-]*\s*[:=]\s*)?[+-]?\d+(?:[.,]\d+)?\s*(?:GHz|MHz|kHz|Hz|cm\s*\^?-?1)"
+    r"(?:[^\s:=]+\s*[:=]\s*[+-]?\d+(?:[.,]\d+)?"
+    r"|\b[+-]?\d+(?:[.,]\d+)?\s*(?:GHz|MHz|kHz|Hz|D\b|cm\s*\^?-?1)"
     r"|\b(?:p|pp|page|pages)\.?\s*\d+(?:\s*(?:-|–|—)\s*\d+)?"
     r"|第?\s*\d+(?:\s*(?:-|–|—|至|到)\s*\d+)?\s*页"
     r"|[\"“”‘’「」『』])",
