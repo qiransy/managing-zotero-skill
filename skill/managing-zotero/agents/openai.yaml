@@ -2,3 +2,6 @@ interface:
   display_name: "Managing Zotero"
   short_description: "Safely organize and enrich Zotero libraries"
   default_prompt: "Use $managing-zotero to review and safely organize these papers in Zotero."
+
+policy:
+  allow_implicit_invocation: true
