@@ -343,7 +343,10 @@ def _write_path(plan: WritePlan) -> str:
 
 
 def _write_payload(plan: WritePlan) -> object:
-    return plan.actions[0].payload
+    payload = plan.actions[0].payload
+    if plan.operation == OperationKind.CREATE_COLLECTION:
+        return [payload]
+    return payload
 
 
 def _parse_write_response(response: Any, plan: WritePlan) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str]]:
