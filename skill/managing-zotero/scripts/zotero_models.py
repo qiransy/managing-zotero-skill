@@ -65,6 +65,9 @@ class WritePlan:
     actions: tuple[WriteAction, ...]
     expected_versions: Mapping[str, int]
     library_version: int | None = None
+    server_fingerprint: str = ""
+    duplicate_checks: tuple[Mapping[str, Any], ...] = ()
+    allowed_roots: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         action_kinds = tuple(action.kind for action in self.actions)

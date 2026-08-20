@@ -158,7 +158,7 @@ class FakeZoteroServer:
                 self._send(handler, 200, self.children.get(key, []), library_header=True)
             elif key:
                 store = self.collections if resource == "collections" else self.items
-                value = store.get(key)
+                value = store.get(key) if resource == "collections" else self._find_item(key)
                 self._send(handler, 200 if value else 404, self._wrap(value) if value else {"error": "not found"}, library_header=True)
             else:
                 values = self._filter(resource, parse_qs(parsed.query))
@@ -220,6 +220,12 @@ class FakeZoteroServer:
             if self.failure_mode == "mixed_items" and index == len(payloads) - 1:
                 failed[slot] = {"code": 400, "message": "injected item failure"}
                 continue
+            if self.failure_mode == "first_item_failure" and index == 0:
+                failed[slot] = {"code": 400, "message": "injected first-item failure"}
+                continue
+            if resource == "items" and payload.get("itemType") in {"note", "attachment"}:
+                self._write_child(slot, payload, successful, unchanged, failed)
+                continue
             store = self.collections if resource == "collections" else self.items
             key = str(payload.get("key", ""))
             existing = store.get(key) if key else None
@@ -239,6 +245,50 @@ class FakeZoteroServer:
             store[key] = candidate
             successful[slot] = {"key": key, "version": candidate["version"]}
         self._send(handler, 200, {"successful": successful, "unchanged": unchanged, "failed": failed}, library_header=True)
+
+    def _write_child(
+        self,
+        slot: str,
+        payload: Mapping[str, Any],
+        successful: dict[str, Any],
+        unchanged: dict[str, Any],
+        failed: dict[str, Any],
+    ) -> None:
+        parent = str(payload.get("parentItem", ""))
+        if parent not in self.items:
+            failed[slot] = {"code": 400, "message": "missing parent item"}
+            return
+        key = str(payload.get("key", ""))
+        children = self.children.setdefault(parent, [])
+        existing = next((value for value in children if value.get("key") == key), None)
+        if existing is not None and payload.get("version") != existing.get("version"):
+            failed[slot] = {"code": 412, "message": "object version conflict"}
+            return
+        if not key:
+            key = ("NOTE" if payload.get("itemType") == "note" else "ATT") + f"{len(children) + 1:05d}"
+        candidate = dict(existing or {})
+        candidate.update(dict(payload))
+        candidate["key"] = key
+        if existing is not None and all(existing.get(name) == value for name, value in payload.items() if name != "version"):
+            unchanged[slot] = {"key": key, "version": existing["version"]}
+            return
+        self.library_version += 1
+        candidate["version"] = self.library_version
+        if existing is None:
+            children.append(candidate)
+        else:
+            existing.clear()
+            existing.update(candidate)
+        successful[slot] = {"key": key, "version": candidate["version"]}
+
+    def _find_item(self, key: str) -> dict[str, Any] | None:
+        if key in self.items:
+            return self.items[key]
+        for children in self.children.values():
+            for child in children:
+                if child.get("key") == key:
+                    return child
+        return None
 
     def _filter(self, resource: str, query: Mapping[str, list[str]]) -> list[dict[str, Any]]:
         store = self.collections if resource == "collections" else self.items
@@ -263,6 +313,7 @@ class FakeZoteroServer:
         versions = {
             **{key: int(value["version"]) for key, value in self.collections.items()},
             **{key: int(value["version"]) for key, value in self.items.items()},
+            **{str(value["key"]): int(value["version"]) for children in self.children.values() for value in children},
         }
         self.records.append(RequestRecord(handler.command, handler.path, headers, body, versions, self.failure_mode))
 

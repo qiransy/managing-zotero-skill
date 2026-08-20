@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from html import escape
 from pathlib import Path
 import re
@@ -40,6 +41,16 @@ _UNVERIFIED_CLAIM = re.compile(
 )
 _TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "assets" / "zotero-brief-note-template.html"
 _MAX_PAPERS_PER_BATCH = 10
+_ZOTERO_KEY_ALPHABET = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+_CODEX_NOTE_MARKER = 'data-codex-note="evidence-bounded-v1"'
+_PARENT_CREATE_FIELDS = frozenset((
+    "itemType", "key", "version", "title", "creators", "date", "publicationTitle",
+    "DOI", "url", "abstractNote", "language", "collections", "tags", "extra",
+))
+_PARENT_REUSE_FIELDS = frozenset(("itemType", "key", "version", "collections"))
+_NOTE_FIELDS = frozenset(("itemType", "key", "version", "parentItem", "note"))
+_ATTACHMENT_FIELDS = frozenset(("itemType", "key", "version", "parentItem", "linkMode", "contentType", "path", "title"))
+_DESTRUCTIVE_FIELDS = frozenset(("deleted", "trash", "trashed", "dateDeleted"))
 
 
 class ApprovalRequired(RuntimeError):
@@ -54,13 +65,22 @@ class BatchLimitExceeded(ValueError):
     """A plan exceeds the conservative first-version batch boundary."""
 
 
+class DuplicateConflict(ValueError):
+    """A probable duplicate requires manual resolution and cannot be written."""
+
+
 @dataclass(frozen=True)
 class ApprovalProof:
     digest: str
     user_confirmed: bool
 
 
-def build_collection_plan(name: str, library_version: int) -> WritePlan:
+def server_fingerprint(server_id: str) -> str:
+    value = str(server_id)
+    return sha256(value.encode("utf-8")).hexdigest() if value else ""
+
+
+def build_collection_plan(name: str, library_version: int, *, server_id: str = "") -> WritePlan:
     """Build the separately-approved, single-collection creation preview."""
     collection_name = str(name).strip()
     if not collection_name:
@@ -74,6 +94,7 @@ def build_collection_plan(name: str, library_version: int) -> WritePlan:
         actions=(WriteAction("create_collection", {"name": collection_name}),),
         expected_versions={},
         library_version=library_version,
+        server_fingerprint=server_fingerprint(server_id),
     )
 
 
@@ -81,6 +102,8 @@ def build_item_plan(
     candidates: Iterable[CandidateItem],
     collection: Mapping[str, Any],
     existing_items: Iterable[Mapping[str, Any]],
+    *,
+    server_id: str = "",
 ) -> WritePlan:
     """Build one bounded item-upsert preview for an already-existing Collection."""
     candidate_list = tuple(candidates)
@@ -95,22 +118,31 @@ def build_item_plan(
     if collection_version is not None:
         expected_versions[collection_key] = collection_version
     payloads: list[dict[str, Any]] = []
+    duplicate_checks: list[dict[str, Any]] = []
     for candidate in candidate_list:
         if not isinstance(candidate, CandidateItem):
             raise TypeError("candidates must be CandidateItem instances")
         payload = candidate_to_zotero_item(candidate, collection_key, _GENERIC_PROFILE)
+        payload["key"] = _new_zotero_key()
+        payload["version"] = 0
         duplicate = classify_duplicate(candidate, existing)
+        duplicate_checks.append(_duplicate_check(candidate, duplicate))
         if duplicate.kind == MatchKind.EXACT_IDENTIFIER and duplicate.item_key:
             matched = next((item for item in existing if str(item.get("key", "")) == duplicate.item_key), {})
             existing_data = _object_data(matched)
             version = _object_version(matched)
-            if version is not None:
-                expected_versions[duplicate.item_key] = version
-                payload["version"] = version
-            payload["key"] = duplicate.item_key
+            if version is None:
+                raise ValueError("an existing duplicate requires a version")
+            expected_versions[duplicate.item_key] = version
             existing_collections = [str(key) for key in existing_data.get("collections", ())]
-            payload["collections"] = list(dict.fromkeys((*existing_collections, collection_key)))
-            payload.pop("tags", None)
+            payload = {
+                "itemType": str(existing_data.get("itemType", "journalArticle")),
+                "key": duplicate.item_key,
+                "version": version,
+                "collections": list(dict.fromkeys((*existing_collections, collection_key))),
+            }
+        elif duplicate.kind == MatchKind.PROBABLE_BIBLIOGRAPHIC:
+            raise DuplicateConflict("probable bibliographic duplicate requires manual confirmation")
         payloads.append(payload)
     return WritePlan(
         operation=OperationKind.UPSERT_ITEMS,
@@ -119,6 +151,8 @@ def build_item_plan(
         actions=(WriteAction("upsert_items", tuple(payloads)),),
         expected_versions=expected_versions,
         library_version=None,
+        server_fingerprint=server_fingerprint(server_id),
+        duplicate_checks=tuple(duplicate_checks),
     )
 
 
@@ -139,6 +173,8 @@ def execute_plan(
         or not secrets.compare_digest(calculated_digest, proof.digest)
     ):
         raise ApprovalRequired("the approved preview digest does not match this plan")
+    _ensure_server_identity(client, plan)
+    _ensure_duplicate_state_unchanged(client, plan)
     _ensure_versions_unchanged(client, plan)
 
     authorization = client.authorize_once()
@@ -170,7 +206,7 @@ def execute_plan(
     affected_keys = tuple(dict.fromkeys((*successful, *unchanged)))
     try:
         fetched = _fetch_objects(client, plan, affected_keys)
-        readback_ok, mismatches = verify_readback(plan, fetched)
+        readback_ok, mismatches = _verify_response_readback(plan, response, fetched)
     except Exception as exc:
         _audit_attempt(
             audit_dir,
@@ -287,13 +323,98 @@ def _validate_plan(plan: WritePlan) -> None:
     if plan.operation == OperationKind.CREATE_COLLECTION:
         if action_kinds != ("create_collection",):
             raise ValueError("a collection plan must contain exactly one collection creation")
+        payload = plan.actions[0].payload
+        if not isinstance(payload, Mapping) or set(payload) != {"name"} or not str(payload.get("name", "")).strip():
+            raise ValueError("collection payload contains unsafe or unknown fields")
     elif plan.operation == OperationKind.UPSERT_ITEMS:
         if action_kinds != ("upsert_items",) or not plan.collection_key:
             raise ValueError("an item plan must target one existing collection")
         if len(_item_payloads(plan)) > _MAX_PAPERS_PER_BATCH:
             raise BatchLimitExceeded("an item plan may contain at most 10 candidate papers")
+        if plan.collection_key not in plan.expected_versions:
+            raise ValueError("the target collection requires a bound version")
+        payloads = _approved_payloads(plan)
+        if not payloads:
+            raise ValueError("an item plan requires at least one payload")
+        if len(plan.duplicate_checks) != len(_item_payloads(plan)):
+            raise ValueError("every top-level paper requires a bound duplicate check")
+        for payload in payloads:
+            _validate_item_payload(plan, payload)
     else:
         raise ValueError("unknown write plan operation")
+
+
+def _validate_item_payload(plan: WritePlan, payload: Mapping[str, Any]) -> None:
+    if _DESTRUCTIVE_FIELDS.intersection(payload):
+        raise ValueError("destructive Zotero fields are forbidden")
+    item_type = str(payload.get("itemType", ""))
+    key = str(payload.get("key", ""))
+    version = payload.get("version")
+    if not key or not isinstance(version, int) or version < 0:
+        raise ValueError("every planned Zotero object requires a key and non-negative version")
+    if version > 0 and plan.expected_versions.get(key) != version:
+        raise ValueError("every existing Zotero object requires its approved version")
+    if item_type == "journalArticle":
+        allowed = _PARENT_REUSE_FIELDS if version > 0 else _PARENT_CREATE_FIELDS
+        if not set(payload).issubset(allowed):
+            raise ValueError("journal item payload contains unsafe or unknown mutation fields")
+        if version > 0 and "tags" in payload:
+            raise ValueError("existing Zotero tags cannot be cleared or replaced")
+        if version == 0 and not str(payload.get("title", "")).strip():
+            raise ValueError("new journal items require a title")
+        collections = payload.get("collections")
+        if not isinstance(collections, (list, tuple)) or plan.collection_key not in map(str, collections):
+            raise ValueError("journal item must retain the approved Collection membership")
+        if "tags" in payload and not isinstance(payload["tags"], (list, tuple)):
+            raise ValueError("tags must be an explicit list")
+        return
+    if item_type == "note":
+        if not set(payload).issubset(_NOTE_FIELDS) or _CODEX_NOTE_MARKER not in str(payload.get("note", "")):
+            raise ValueError("only stable-marker Codex notes may be created or updated")
+        if not str(payload.get("parentItem", "")):
+            raise ValueError("Codex notes require a parent item")
+        return
+    if item_type == "attachment":
+        if not set(payload).issubset(_ATTACHMENT_FIELDS):
+            raise ValueError("attachment payload contains unsafe or unknown fields")
+        if payload.get("linkMode") != "linked_file" or payload.get("contentType") != "application/pdf":
+            raise ValueError("only linked PDF attachments are allowed")
+        rebuilt = build_linked_attachment(str(payload.get("parentItem", "")), str(payload.get("path", "")), plan.allowed_roots)
+        if rebuilt["path"] != payload.get("path"):
+            raise ValueError("linked PDF path changed after preview")
+        return
+    raise ValueError("unsafe or unknown Zotero item type")
+
+
+def _ensure_server_identity(client: Any, plan: WritePlan) -> None:
+    probe = getattr(client, "probe", None)
+    if not callable(probe):
+        return
+    if not re.fullmatch(r"[0-9a-f]{64}", plan.server_fingerprint):
+        raise PreviewStale("preview is not bound to a Zotero Server ID")
+    status = probe()
+    if not getattr(status, "connected", False) or not getattr(status, "server_id", ""):
+        raise PreviewStale("Zotero Server ID is unavailable")
+    if not secrets.compare_digest(server_fingerprint(status.server_id), plan.server_fingerprint):
+        raise PreviewStale("Zotero Server ID changed after preview")
+
+
+def _ensure_duplicate_state_unchanged(client: Any, plan: WritePlan) -> None:
+    if plan.operation != OperationKind.UPSERT_ITEMS or not plan.duplicate_checks:
+        return
+    get_json = getattr(client, "get_json", None)
+    if not callable(get_json):
+        return
+    for check in plan.duplicate_checks:
+        if not isinstance(check, Mapping):
+            raise PreviewStale("duplicate binding is malformed")
+        candidate = _candidate_from_duplicate_check(check)
+        query = _duplicate_query(candidate)
+        payload, _ = get_json("users/0/items", query)
+        items = payload if isinstance(payload, list) else []
+        current = classify_duplicate(candidate, items)
+        if current.kind.value != str(check.get("match_kind", "")) or current.item_key != str(check.get("item_key", "")):
+            raise PreviewStale("library-wide duplicate state changed after preview")
 
 
 def _ensure_versions_unchanged(client: Any, plan: WritePlan) -> None:
@@ -359,6 +480,40 @@ def _parse_write_response(response: Any, plan: WritePlan) -> tuple[tuple[str, ..
     return successful, unchanged, failed
 
 
+def _verify_response_readback(
+    plan: WritePlan,
+    response: Any,
+    fetched_objects: Mapping[str, Any],
+) -> tuple[bool, dict[str, str]]:
+    if plan.operation == OperationKind.CREATE_COLLECTION:
+        return verify_readback(plan, fetched_objects)
+    if not isinstance(response, Mapping):
+        return False, {"response": "Zotero returned an invalid multi-write response"}
+    payloads = _approved_payloads(plan)
+    fetched = {str(key): _object_data(value) for key, value in fetched_objects.items()}
+    mismatches: dict[str, str] = {}
+    for group_name in ("successful", "unchanged"):
+        group = response.get(group_name)
+        if not isinstance(group, Mapping):
+            continue
+        for raw_index, value in group.items():
+            try:
+                index = int(raw_index)
+                expected = payloads[index]
+            except (ValueError, IndexError, TypeError):
+                mismatches[f"response.{raw_index}"] = "Zotero returned an invalid payload index"
+                continue
+            key = str(value.get("key", "")) if isinstance(value, Mapping) else str(value)
+            if not key:
+                key = str(expected.get("key", ""))
+            actual = fetched.get(key)
+            if not isinstance(actual, Mapping):
+                mismatches[f"{key or raw_index}.object"] = "object was not returned by read-back"
+                continue
+            _compare_item_fields(expected, actual, key or str(raw_index), mismatches)
+    return not mismatches, mismatches
+
+
 def _response_keys(group: Any, payloads: tuple[Mapping[str, Any], ...]) -> tuple[str, ...]:
     if not isinstance(group, Mapping):
         return ()
@@ -389,6 +544,47 @@ def _failure_reasons(group: Any) -> dict[str, str]:
         else:
             reasons[str(index)] = str(detail)
     return reasons
+
+
+def _duplicate_check(candidate: CandidateItem, duplicate: Any) -> dict[str, Any]:
+    return {
+        "title": candidate.title,
+        "creators": [dict(creator) for creator in candidate.creators],
+        "year": candidate.year,
+        "doi": candidate.doi,
+        "pmid": candidate.pmid,
+        "arxiv_id": candidate.arxiv_id,
+        "match_kind": duplicate.kind.value,
+        "item_key": duplicate.item_key,
+    }
+
+
+def _candidate_from_duplicate_check(check: Mapping[str, Any]) -> CandidateItem:
+    creators = check.get("creators", ())
+    if not isinstance(creators, (list, tuple)) or not all(isinstance(value, Mapping) for value in creators):
+        raise PreviewStale("duplicate binding creators are malformed")
+    return CandidateItem(
+        title=str(check.get("title", "")),
+        creators=tuple(dict(value) for value in creators),
+        year=str(check.get("year", "")),
+        doi=str(check.get("doi", "")),
+        pmid=str(check.get("pmid", "")),
+        arxiv_id=str(check.get("arxiv_id", "")),
+    )
+
+
+def _duplicate_query(candidate: CandidateItem) -> Mapping[str, str]:
+    if candidate.doi:
+        return {"doi": candidate.doi}
+    if candidate.pmid:
+        return {"q": "PMID: " + candidate.pmid}
+    if candidate.arxiv_id:
+        return {"q": "arXiv: " + candidate.arxiv_id}
+    return {"q": candidate.title}
+
+
+def _new_zotero_key() -> str:
+    return "".join(secrets.choice(_ZOTERO_KEY_ALPHABET) for _ in range(8))
 
 
 def _fetch_objects(client: Any, plan: WritePlan, keys: tuple[str, ...]) -> Mapping[str, Any]:

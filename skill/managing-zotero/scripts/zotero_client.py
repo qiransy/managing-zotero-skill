@@ -83,8 +83,13 @@ class UrllibTransport:
         request_headers["Zotero-API-Version"] = "3"
         request_headers["User-Agent"] = "Codex-managing-zotero/1.0"
         request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect())
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as result:
+            with opener.open(request, timeout=timeout) as result:
                 return HttpResponse(result.status, dict(result.headers.items()), result.read())
         except urllib.error.HTTPError as error:
             return HttpResponse(error.code, dict(error.headers.items()), error.read())

@@ -1,6 +1,8 @@
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -162,13 +164,58 @@ class ClientTests(unittest.TestCase):
             def __exit__(self, exc_type, exc, traceback):
                 return False
 
-        with patch("zotero_client.urllib.request.urlopen", return_value=Reply()) as open_url:
+        with patch("zotero_client.urllib.request.OpenerDirector.open", return_value=Reply()) as open_url:
             UrllibTransport().request(
                 "GET", "http://127.0.0.1:23119/api/", headers={"Zotero-API-Version": "9"}
             )
         request = open_url.call_args.args[0]
         self.assertEqual(request.get_header("Zotero-api-version"), "3")
         self.assertNotIn("Mozilla", request.get_header("User-agent"))
+
+    def test_transport_rejects_redirect_without_forwarding_authorization(self):
+        captured = []
+
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                captured.append(dict(self.headers.items()))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/capture")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+        redirect_thread.start()
+        try:
+            response = UrllibTransport().request(
+                "POST",
+                f"http://127.0.0.1:{redirect.server_port}/api/users/0/items",
+                headers={"Zotero-API-Key": "must-not-forward"},
+                body=b"[]",
+            )
+            self.assertEqual(response.status, 302)
+            self.assertEqual(captured, [])
+        finally:
+            redirect.shutdown()
+            redirect.server_close()
+            target.shutdown()
+            target.server_close()
+            redirect_thread.join(timeout=5)
+            target_thread.join(timeout=5)
 
     def test_read_path_cannot_replace_loopback_origin(self):
         transport = FakeTransport([])
