@@ -27,7 +27,7 @@ from zotero_workflow import (
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory(dir=Path.cwd(), prefix="workflow-")
-        self.approved_root = Path(self.tempdir.name) / "D-approved-library"
+        self.approved_root = Path(self.tempdir.name) / "approved-library"
         self.approved_root.mkdir()
         self.final_pdf = self.approved_root / "paper.pdf"
         self.final_pdf.write_bytes(b"%PDF-1.7")
@@ -49,6 +49,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("1234.567", note)
         self.assertNotIn("状态：全文已核查", tags)
         self.assertIn("状态：待获取全文", tags)
+
+    def test_low_evidence_with_accessible_pdf_reports_acquired_without_claiming_review(self):
+        for evidence_level, prefix in (
+            (EvidenceLevel.METADATA_ONLY, "仅元数据"),
+            (EvidenceLevel.ABSTRACT_ONLY, "基于摘要"),
+        ):
+            with self.subTest(evidence_level=evidence_level):
+                candidate = CandidateItem(
+                    title="A paper",
+                    evidence_level=evidence_level,
+                    linked_pdf=str(self.final_pdf),
+                )
+                note = render_note(candidate, "generic")
+                self.assertIn(f"{prefix}；全文已获取，尚未深读", note)
+                self.assertNotIn("待获取全文", note)
+                self.assertNotIn("已核查全文", note)
 
     def test_generic_profile_does_not_add_microwave_tags(self):
         candidate = CandidateItem(title="A paper", tags=("实验：CP-FTMW",))
@@ -92,11 +108,14 @@ class WorkflowTests(unittest.TestCase):
             evidence_level=EvidenceLevel.FULL_TEXT_VERIFIED,
             note_fields={"relevance": "<script>alert(1)</script>"},
         )
-        note = render_note(candidate, "generic", "D:\\reports\\<report>.md")
+        note = render_note(candidate, "generic", "F:\\reports\\<report>.md")
         self.assertIn("Codex｜文献卡", note)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", note)
         self.assertNotIn("<script>", note)
         self.assertIn("data-codex-note=\"evidence-bounded-v1\"", note)
+        self.assertIn("本地详细报告", note)
+        self.assertNotIn("D 盘详细报告", note)
+        self.assertIn("F:\\reports\\&lt;report&gt;.md", note)
 
     def test_abstract_only_does_not_promote_unclassified_constant_fields(self):
         candidate = CandidateItem(
@@ -332,6 +351,31 @@ class PreviewAndExecutionTests(unittest.TestCase):
         self.assertEqual(payload["collections"], ["OTHER001", "COLLECT01"])
         self.assertNotIn("tags", payload)
 
+    def test_new_parent_omits_client_generated_key_and_version(self):
+        plan = build_item_plan(self.candidates(), self.collection, [])
+        payload = plan.actions[0].payload[0]
+        self.assertNotIn("key", payload)
+        self.assertNotIn("version", payload)
+
+    def test_loaded_keyed_new_parent_is_rejected_before_authorization(self):
+        plan = build_item_plan(self.candidates(), self.collection, [])
+        keyed_payload = {**plan.actions[0].payload[0], "key": "PRESET01", "version": 0}
+        keyed_plan = WritePlan(
+            operation=plan.operation,
+            collection_key=plan.collection_key,
+            collection_name=plan.collection_name,
+            actions=(WriteAction("upsert_items", (keyed_payload,)),),
+            expected_versions=plan.expected_versions,
+            library_version=plan.library_version,
+            server_fingerprint=plan.server_fingerprint,
+            duplicate_checks=plan.duplicate_checks,
+            allowed_roots=plan.allowed_roots,
+        )
+        with self.assertRaisesRegex(ValueError, "must omit key/version"):
+            execute_plan(self.client, keyed_plan, ApprovalProof(plan_digest(keyed_plan), True))
+        self.assertEqual(self.client.authorization_calls, 0)
+        self.assertEqual(self.client.write_calls, 0)
+
     def test_exact_duplicate_does_not_replace_trusted_metadata_from_candidate(self):
         candidate = CandidateItem(
             title="Untrusted replacement title",
@@ -434,8 +478,9 @@ class PreviewAndExecutionTests(unittest.TestCase):
         plan = self.item_plan()
         approved = plan.actions[0].payload[0]
         fetched = {
-            approved["key"]: {
+            "ITEM0001": {
                 **approved,
+                "key": "ITEM0001",
                 "notes": [{"note": "A personal note"}],
                 "extra": "unrelated field",
             }
@@ -444,15 +489,31 @@ class PreviewAndExecutionTests(unittest.TestCase):
         self.assertTrue(verified)
         self.assertEqual(mismatches, {})
 
+    def test_verify_readback_accepts_omitted_empty_doi(self):
+        plan = build_item_plan((CandidateItem(title="Paper without DOI"),), self.collection, [])
+        approved = plan.actions[0].payload[0]
+        fetched = {field: value for field, value in approved.items() if field != "DOI"}
+        verified, mismatches = verify_readback(plan, {"ITEM0001": fetched})
+        self.assertTrue(verified)
+        self.assertEqual(mismatches, {})
+
+    def test_verify_readback_rejects_omitted_nonempty_doi(self):
+        plan = self.item_plan()
+        approved = plan.actions[0].payload[0]
+        fetched = {field: value for field, value in approved.items() if field != "DOI"}
+        verified, mismatches = verify_readback(plan, {"ITEM0001": fetched})
+        self.assertFalse(verified)
+        self.assertIn("ITEM0001.DOI", mismatches)
+
     def test_verify_readback_reports_changed_approved_title(self):
         plan = self.item_plan()
         approved = plan.actions[0].payload[0]
         verified, mismatches = verify_readback(
             plan,
-            {approved["key"]: {**approved, "title": "Changed"}},
+            {"ITEM0001": {**approved, "key": "ITEM0001", "title": "Changed"}},
         )
         self.assertFalse(verified)
-        self.assertIn(f"{approved['key']}.title", mismatches)
+        self.assertIn("ITEM0001.title", mismatches)
 
     def test_verify_readback_checks_codex_note_marker_and_linked_attachment_path(self):
         plan = WritePlan(
@@ -483,7 +544,7 @@ class _FakeWorkflowClient:
         self.discard_calls = 0
         self.current_versions = {"COLLECT01": 4}
         self.write_response = {"successful": {"0": "ITEM0001"}, "unchanged": {}, "failed": {}}
-        self.fetched_objects = {"ITEM0001": {"title": "Paper 0", "DOI": "10.1000/0", "collections": ["COLLECT01"], "tags": []}}
+        self.fetched_objects = {"ITEM0001": {"itemType": "journalArticle", "title": "Paper 0", "DOI": "10.1000/0", "collections": ["COLLECT01"], "tags": []}}
 
     def get_versions(self, keys):
         return {key: self.current_versions.get(key) for key in keys}

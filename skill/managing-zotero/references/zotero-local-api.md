@@ -26,7 +26,9 @@ Use narrow reads only:
 | Narrow Collection reads and approved create | `GET` or approved `POST /api/users/0/collections` |
 | Narrow item reads and approved upsert | `GET` or approved `POST /api/users/0/items` |
 
-Send `Zotero-API-Version: 3` and a User-Agent on each request. For `POST /api/local/authorize`, send JSON and `Zotero-Server-ID`. For an approved write, send JSON, `Zotero-API-Key`, `Zotero-Server-ID`, and `If-Unmodified-Since-Version` when the preview supplies a version. Let the CLI obtain and consume the one-time API key; never print, save, or manually reuse it.
+Send `Zotero-API-Version: 3` and a User-Agent on each request. For `POST /api/local/authorize`, send JSON and `Zotero-Server-ID`. For an approved write, send JSON, `Zotero-API-Key`, `Zotero-Server-ID`, and `If-Unmodified-Since-Version` when the preview supplies a version. Let the CLI obtain and consume the one-time API key; never print, save, or manually reuse it. Choose one-time **Allow**, not **Always Allow**. A remembered authorization is intentionally rejected by this approval-bound workflow.
+
+For newly created items, notes, and attachments, omit both `key` and `version` and let Zotero return the actual key. Zotero 10 local API builds can fail before save when a new object carries a client-generated key with `version: 0`. Create bibliographic parents first, save and verify their returned keys, and create child notes/attachments only in a second approved request that references those actual parent keys. Existing reused parents keep their key and positive version.
 
 ## Status handling
 
@@ -49,4 +51,4 @@ $SKILL_DIR = (Resolve-Path 'C:\path\to\installed\managing-zotero').Path
 & 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' "$SKILL_DIR\scripts\zotero_local.py" status
 ```
 
-The CLI redacts the Server ID in `status`, accepts no raw authorization command, and permits only `create_collection` and `upsert_items` plans. An `apply` requires the preview file, its exact SHA-256 digest, `--confirm-user-approved`, and an absolute audit directory.
+The CLI redacts the Server ID in `status`, accepts no raw authorization command, and permits only `create_collection`, `upsert_items`, and `create_children` plans. An `apply` requires the preview file, its exact SHA-256 digest, `--confirm-user-approved`, and an absolute audit directory. Parent `apply` should also use `--result-output`; `preview-children` requires that verified result and its matching parent plan.

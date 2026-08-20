@@ -53,7 +53,7 @@ Method: one fresh, isolated agent read `SKILL.md`, `zotero-local-api.md`, and `s
 
 我会要求：
 
-- 先确定一个已批准的最终绝对路径，例如 `D:\research\approved-pdfs\paper.pdf`；
+- 先确定一个已批准的最终绝对路径，例如 `F:\research\approved-pdfs\paper.pdf`；
 - 确认该文件已位于最终目录且可读取；
 - 以该最终目录作为 `--allowed-root`；
 - 生成包含最终 PDF 路径的条目写入预览；
@@ -68,7 +68,7 @@ Method: one fresh, isolated agent read `SKILL.md`, `zotero-local-api.md`, and `s
 | 1 | **Pass** | Refused silent execution; enforced the 10-paper default and separate Collection and item preview/approval phrases. |
 | 2 | **Pass** | Retained `状态：待获取全文`; refused both full-text elevation and exact constants. |
 | 3 | **Pass** | Classified the DOI match as reuse, rejected duplication/merge/overwrite, and preserved personal notes. |
-| 4 | **Pass** | Rejected cache attachment and required an existing approved final absolute D-drive path before linking. |
+| 4 | **Pass** | Rejected cache attachment and required an existing path under an approved final absolute directory before linking. |
 
 All criteria passed. No new rationalization appeared, no Skill change was needed after GREEN, and no real Zotero authorization or write occurred.
 

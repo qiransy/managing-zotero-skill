@@ -8,7 +8,6 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import re
-import secrets
 import sys
 from typing import Any, Callable, Mapping, TextIO
 
@@ -19,16 +18,16 @@ from zotero_client import (
     ZoteroLibraryLockedError,
     ZoteroVersionConflict,
 )
-from zotero_models import CandidateItem, EvidenceLevel, OperationKind, WriteAction, WritePlan, canonical_json, plan_digest
+from zotero_models import CandidateItem, EvidenceLevel, ExecutionResult, OperationKind, WriteAction, WritePlan, canonical_json, plan_digest
 from zotero_workflow import (
     ApprovalProof, ApprovalRequired, BatchLimitExceeded, DuplicateConflict, PreviewStale,
-    build_collection_plan, build_item_plan, build_linked_attachment,
-    candidate_to_zotero_item, execute_plan, render_note,
+    build_child_plan, build_collection_plan, build_item_plan,
+    candidate_to_zotero_item, execute_plan,
 )
 
 
 _SECRET = re.compile(r"(?i)(?:api[_-]?key|authorization|token|secret|zotero-server-id)\s*[:=]\s*[^\s,;]+")
-_ALLOWED_ACTIONS = frozenset(("create_collection", "upsert_items"))
+_ALLOWED_ACTIONS = frozenset(("create_collection", "upsert_items", "create_children"))
 
 
 class _Parser(argparse.ArgumentParser):
@@ -50,17 +49,26 @@ def _parser() -> argparse.ArgumentParser:
     preview_collection = commands.add_parser("preview-collection", help="write a collection creation preview")
     preview_collection.add_argument("--name", required=True)
     preview_collection.add_argument("--output", required=True)
-    preview_items = commands.add_parser("preview-items", help="write an item-upsert preview")
+    preview_items = commands.add_parser("preview-items", help="write a parent-item upsert preview")
     preview_items.add_argument("--input", required=True)
     preview_items.add_argument("--collection-key", required=True)
     preview_items.add_argument("--profile", choices=("generic", "microwave-spectroscopy"), required=True)
     preview_items.add_argument("--allowed-root", action="append", required=True)
     preview_items.add_argument("--output", required=True)
+    preview_children = commands.add_parser("preview-children", help="write a child-object preview after verified parent creation")
+    preview_children.add_argument("--input", required=True)
+    preview_children.add_argument("--parent-plan", required=True)
+    preview_children.add_argument("--parent-result", required=True)
+    preview_children.add_argument("--collection-key", required=True)
+    preview_children.add_argument("--profile", choices=("generic", "microwave-spectroscopy"), required=True)
+    preview_children.add_argument("--allowed-root", action="append", required=True)
+    preview_children.add_argument("--output", required=True)
     apply = commands.add_parser("apply", help="apply one exact approved preview")
     apply.add_argument("--plan", required=True)
     apply.add_argument("--approval-digest", required=True)
     apply.add_argument("--confirm-user-approved", action="store_true")
     apply.add_argument("--audit-dir", required=True)
+    apply.add_argument("--result-output")
     return parser
 
 
@@ -133,6 +141,28 @@ def _dispatch(args: argparse.Namespace, client: Any) -> dict[str, Any]:
         plan = _with_profile(plan, candidates, args.profile, roots)
         _write_plan(args.output, plan)
         return {"plan": str(Path(args.output)), "digest": plan_digest(plan), "operation": plan.operation.value}
+    if args.command == "preview-children":
+        status = _preview_status(client)
+        candidates = _read_candidates(args.input)
+        if len(candidates) > 10:
+            raise BatchLimitExceeded("candidate file may contain at most 10 papers")
+        roots = _validate_allowed_roots(args.allowed_root, candidates)
+        collection = _read_collection(client, args.collection_key)
+        parent_plan = _read_plan(args.parent_plan)
+        parent_result = _read_execution_result(args.parent_result)
+        parent_objects = _read_parent_objects(client, parent_result.resolved_keys)
+        plan = build_child_plan(
+            candidates,
+            parent_plan,
+            parent_result,
+            collection,
+            parent_objects,
+            profile_name=args.profile,
+            allowed_roots=roots,
+            server_id=status.server_id,
+        )
+        _write_plan(args.output, plan)
+        return {"plan": str(Path(args.output)), "digest": plan_digest(plan), "operation": plan.operation.value}
     if args.command == "apply":
         _validate_digest(args.approval_digest)
         if not args.confirm_user_approved:
@@ -146,6 +176,8 @@ def _dispatch(args: argparse.Namespace, client: Any) -> dict[str, Any]:
             raise ZoteroConnectionError("local Zotero API is read-only or unavailable")
         execution = execute_plan(client, plan, ApprovalProof(args.approval_digest, True), audit_dir=audit_dir)
         result = asdict(execution)
+        if args.result_output:
+            _write_json(args.result_output, result)
         if not execution.verified or execution.failed:
             raise _PartialResult(result)
         return result
@@ -238,11 +270,6 @@ def _library_matches(client: Any, candidates: tuple[CandidateItem, ...]) -> list
     return list(found.values())
 
 
-def _new_key() -> str:
-    alphabet = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
-    return "".join(secrets.choice(alphabet) for _ in range(8))
-
-
 def _read_candidates(path: str) -> tuple[CandidateItem, ...]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     records = value.get("candidates") if isinstance(value, Mapping) else value
@@ -281,22 +308,7 @@ def _with_profile(
             parent = dict(payload)
         else:
             parent = candidate_to_zotero_item(candidate, plan.collection_key, profile)
-            parent["key"] = str(payload.get("key") or _new_key())
-            parent["version"] = 0
         revised.append(parent)
-        parent_key = str(parent["key"])
-        revised.append({
-            "itemType": "note",
-            "key": _new_key(),
-            "version": 0,
-            "parentItem": parent_key,
-            "note": render_note(candidate, profile),
-        })
-        if candidate.linked_pdf:
-            attachment = build_linked_attachment(parent_key, candidate.linked_pdf, allowed_roots)
-            attachment["key"] = _new_key()
-            attachment["version"] = 0
-            revised.append(attachment)
     return WritePlan(
         plan.operation,
         plan.collection_key,
@@ -336,6 +348,45 @@ def _write_plan(path: str, plan: WritePlan) -> None:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(canonical_json(plan) + "\n", encoding="utf-8")
+
+
+def _write_json(path: str, value: Mapping[str, Any]) -> None:
+    output = Path(path)
+    if not output.is_absolute():
+        raise ValueError("result-output must be absolute")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def _read_execution_result(path: str) -> ExecutionResult:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping):
+        raise ValueError("parent result must be a JSON object")
+    successful = value.get("successful_keys", [])
+    unchanged = value.get("unchanged_keys", [])
+    resolved = value.get("resolved_keys", [])
+    failed = value.get("failed", {})
+    if not all(isinstance(group, list) and all(isinstance(key, str) for key in group) for group in (successful, unchanged, resolved)):
+        raise ValueError("parent result key lists are invalid")
+    if not isinstance(failed, Mapping) or not all(isinstance(key, str) and isinstance(reason, str) for key, reason in failed.items()):
+        raise ValueError("parent result failures are invalid")
+    digest = value.get("plan_digest")
+    verified = value.get("verified")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(verified, bool):
+        raise ValueError("parent result digest or verification state is invalid")
+    return ExecutionResult(digest, tuple(successful), tuple(unchanged), tuple(resolved), dict(failed), verified)
+
+
+def _read_parent_objects(client: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    if not keys or any(not key for key in keys):
+        raise PreviewStale("parent result does not contain resolved Zotero keys")
+    objects: dict[str, Any] = {}
+    for key in keys:
+        payload, _ = client.get_json(f"users/0/items/{key}")
+        if not isinstance(payload, Mapping):
+            raise PreviewStale(f"parent {key} was not returned by Zotero")
+        objects[key] = payload
+    return objects
 
 
 def _read_plan(path: str) -> WritePlan:

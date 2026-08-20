@@ -113,6 +113,42 @@ class ZoteroIntegrationTests(unittest.TestCase):
             self.assertEqual(server.authorization_count, 0)
             self.assertEqual(server.write_count, 0)
 
+    def test_fake_matches_real_zotero_keyed_new_item_failure(self):
+        with FakeZoteroServer(test_mode=True) as server:
+            client = self.client(server)
+            authorization = client.authorize_once()
+            response, _ = client.post_json(
+                "users/0/items",
+                [{
+                    "itemType": "journalArticle",
+                    "key": "PRESET01",
+                    "version": 0,
+                    "title": "Synthetic keyed item",
+                    "creators": [],
+                    "collections": [],
+                }],
+                authorization,
+            )
+            self.assertEqual(response["successful"], {})
+            self.assertIn("primaryData", response["failed"]["0"]["message"])
+            self.assertNotIn("PRESET01", server.items)
+
+    def test_fake_assigns_unique_keys_to_keyless_children_across_parents(self):
+        with FakeZoteroServer(test_mode=True) as server:
+            server.seed_item("PARENT01", title="Parent one", doi="10.0000/one")
+            server.seed_item("PARENT02", title="Parent two", doi="10.0000/two")
+            client = self.client(server)
+            response, _ = client.post_json(
+                "users/0/items",
+                [
+                    {"itemType": "note", "parentItem": "PARENT01", "note": "one"},
+                    {"itemType": "note", "parentItem": "PARENT02", "note": "two"},
+                ],
+                client.authorize_once(),
+            )
+            keys = [response["successful"][str(index)]["key"] for index in range(2)]
+            self.assertEqual(len(set(keys)), 2)
+
     def test_locked_library_is_not_retried_and_exception_is_secret_free(self):
         with FakeZoteroServer(test_mode=True, failure_mode="library_locked") as server:
             plan = build_collection_plan("synthetic-system", server.library_version, server_id=server.server_id)
@@ -153,7 +189,8 @@ class ZoteroIntegrationTests(unittest.TestCase):
                 ApprovalProof(plan_digest(plan), True),
                 audit_dir=self.temp / "audit",
             )
-            self.assertEqual(result.successful_keys, (plan.actions[0].payload[0]["key"],))
+            self.assertEqual(result.successful_keys, ("ITEM00001",))
+            self.assertEqual(result.resolved_keys, ("ITEM00001", ""))
             self.assertEqual(result.unchanged_keys, ())
             self.assertEqual(result.failed["1"], "injected item failure")
             self.assertNotIn("1.object", result.failed)
@@ -409,7 +446,8 @@ class ZoteroIntegrationTests(unittest.TestCase):
                     "creators": [],
                     "tags": ["实验：CP-FTMW"], "note_fields": {"relevance": "摘要支持相关性"},
                 }], ensure_ascii=False), encoding="utf-8")
-                plan_path = final_root / "plan.json"
+                plan_path = final_root / "parent-plan.json"
+                parent_result_path = final_root / "parent-result.json"
                 code, output, error = self.run_cli(server, [
                     "preview-items", "--input", str(candidate_path), "--collection-key", "COLLECT01",
                     "--profile", "microwave-spectroscopy", "--allowed-root", str(final_root), "--output", str(plan_path),
@@ -417,16 +455,42 @@ class ZoteroIntegrationTests(unittest.TestCase):
                 self.assertEqual(code, 0, error)
                 plan = json.loads(plan_path.read_text(encoding="utf-8"))
                 payloads = plan["actions"][0]["payload"]
-                self.assertEqual([value["itemType"] for value in payloads], ["journalArticle", "note", "attachment"])
-                self.assertIn('data-codex-note="evidence-bounded-v1"', payloads[1]["note"])
+                self.assertEqual([value["itemType"] for value in payloads], ["journalArticle"])
+                self.assertNotIn("key", payloads[0])
+                self.assertNotIn("version", payloads[0])
                 self.assertNotIn("状态：待获取全文", [tag["tag"] for tag in payloads[0]["tags"]])
                 code, _, error = self.run_cli(server, [
                     "apply", "--plan", str(plan_path), "--approval-digest", json.loads(output)["digest"],
                     "--confirm-user-approved", "--audit-dir", str(final_root / "audit"),
+                    "--result-output", str(parent_result_path),
                 ])
                 self.assertEqual(code, 0, error)
-                parent = payloads[0]["key"]
+                parent_result = json.loads(parent_result_path.read_text(encoding="utf-8"))
+                parent = parent_result["resolved_keys"][0]
+                child_plan_path = final_root / "child-plan.json"
+                code, output, error = self.run_cli(server, [
+                    "preview-children", "--input", str(candidate_path),
+                    "--parent-plan", str(plan_path), "--parent-result", str(parent_result_path),
+                    "--collection-key", "COLLECT01", "--profile", "microwave-spectroscopy",
+                    "--allowed-root", str(final_root), "--output", str(child_plan_path),
+                ])
+                self.assertEqual(code, 0, error)
+                child_payloads = json.loads(child_plan_path.read_text(encoding="utf-8"))["actions"][0]["payload"]
+                self.assertEqual([value["itemType"] for value in child_payloads], ["note", "attachment"])
+                self.assertTrue(all(value["parentItem"] == parent for value in child_payloads))
+                self.assertTrue(all("key" not in value and "version" not in value for value in child_payloads))
+                self.assertIn('data-codex-note="evidence-bounded-v1"', child_payloads[0]["note"])
+                self.assertIn("基于摘要；全文已获取，尚未深读", child_payloads[0]["note"])
+                self.assertIn("本地详细报告", child_payloads[0]["note"])
+                self.assertNotIn("D 盘详细报告", child_payloads[0]["note"])
+                code, _, error = self.run_cli(server, [
+                    "apply", "--plan", str(child_plan_path), "--approval-digest", json.loads(output)["digest"],
+                    "--confirm-user-approved", "--audit-dir", str(final_root / "audit"),
+                ])
+                self.assertEqual(code, 0, error)
                 self.assertEqual([child["itemType"] for child in server.children[parent]], ["note", "attachment"])
+                self.assertEqual(server.authorization_count, 2)
+                self.assertEqual(server.write_count, 2)
 
     def test_first_item_failure_preserves_index_mapping_and_cli_emits_partial_json(self):
         with FakeZoteroServer(test_mode=True, failure_mode="first_item_failure") as server:
@@ -443,16 +507,16 @@ class ZoteroIntegrationTests(unittest.TestCase):
             ])
             self.assertEqual(code, 0, error)
             digest = json.loads(output)["digest"]
-            planned_payloads = json.loads(plan_path.read_text(encoding="utf-8"))["actions"][0]["payload"]
             code, output, error = self.run_cli(server, [
                 "apply", "--plan", str(plan_path), "--approval-digest", digest,
                 "--confirm-user-approved", "--audit-dir", str(self.temp / "audit"),
             ])
             self.assertEqual(code, 6)
             partial = json.loads(output)
-            self.assertEqual(partial["successful_keys"], [planned_payloads[2]["key"], planned_payloads[3]["key"]])
+            self.assertEqual(partial["successful_keys"], ["ITEM00001"])
+            self.assertEqual(partial["resolved_keys"], ["", "ITEM00001"])
             self.assertEqual(partial["failed"]["0"], "injected first-item failure")
-            self.assertNotIn("2.title", partial["failed"])
+            self.assertNotIn("1.title", partial["failed"])
 
 
 if __name__ == "__main__":

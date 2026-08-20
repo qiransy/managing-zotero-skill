@@ -223,6 +223,18 @@ class FakeZoteroServer:
             if self.failure_mode == "first_item_failure" and index == 0:
                 failed[slot] = {"code": 400, "message": "injected first-item failure"}
                 continue
+            supplied_key = str(payload.get("key", ""))
+            if (
+                resource == "items"
+                and supplied_key
+                and payload.get("version") == 0
+                and self._find_item(supplied_key) is None
+            ):
+                failed[slot] = {
+                    "code": 400,
+                    "message": f"'primaryData' not loaded for item (null/1/{supplied_key})",
+                }
+                continue
             if resource == "items" and payload.get("itemType") in {"note", "attachment"}:
                 self._write_child(slot, payload, successful, unchanged, failed)
                 continue
@@ -265,7 +277,8 @@ class FakeZoteroServer:
             failed[slot] = {"code": 412, "message": "object version conflict"}
             return
         if not key:
-            key = ("NOTE" if payload.get("itemType") == "note" else "ATT") + f"{len(children) + 1:05d}"
+            child_index = sum(len(values) for values in self.children.values()) + 1
+            key = ("NOTE" if payload.get("itemType") == "note" else "ATT") + f"{child_index:05d}"
         candidate = dict(existing or {})
         candidate.update(dict(payload))
         candidate["key"] = key

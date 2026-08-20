@@ -23,6 +23,7 @@ class MatchKind(str, Enum):
 class OperationKind(str, Enum):
     CREATE_COLLECTION = "create_collection"
     UPSERT_ITEMS = "upsert_items"
+    CREATE_CHILDREN = "create_children"
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ class ExecutionResult:
     plan_digest: str
     successful_keys: tuple[str, ...] = ()
     unchanged_keys: tuple[str, ...] = ()
+    resolved_keys: tuple[str, ...] = ()
     failed: Mapping[str, str] = field(default_factory=dict)
     verified: bool = False
 

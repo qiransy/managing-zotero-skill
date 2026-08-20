@@ -15,6 +15,7 @@ from zotero_audit import AuditEvent, append_audit_event
 from zotero_dedupe import classify_duplicate
 from zotero_models import (
     CandidateItem,
+    canonical_json,
     EvidenceLevel,
     ExecutionResult,
     MatchKind,
@@ -41,15 +42,14 @@ _UNVERIFIED_CLAIM = re.compile(
 )
 _TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "assets" / "zotero-brief-note-template.html"
 _MAX_PAPERS_PER_BATCH = 10
-_ZOTERO_KEY_ALPHABET = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
 _CODEX_NOTE_MARKER = 'data-codex-note="evidence-bounded-v1"'
 _PARENT_CREATE_FIELDS = frozenset((
-    "itemType", "key", "version", "title", "creators", "date", "publicationTitle",
+    "itemType", "title", "creators", "date", "publicationTitle",
     "DOI", "url", "abstractNote", "language", "collections", "tags", "extra",
 ))
 _PARENT_REUSE_FIELDS = frozenset(("itemType", "key", "version", "collections"))
-_NOTE_FIELDS = frozenset(("itemType", "key", "version", "parentItem", "note"))
-_ATTACHMENT_FIELDS = frozenset(("itemType", "key", "version", "parentItem", "linkMode", "contentType", "path", "title"))
+_NOTE_FIELDS = frozenset(("itemType", "parentItem", "note"))
+_ATTACHMENT_FIELDS = frozenset(("itemType", "parentItem", "linkMode", "contentType", "path", "title"))
 _DESTRUCTIVE_FIELDS = frozenset(("deleted", "trash", "trashed", "dateDeleted"))
 
 
@@ -123,8 +123,6 @@ def build_item_plan(
         if not isinstance(candidate, CandidateItem):
             raise TypeError("candidates must be CandidateItem instances")
         payload = candidate_to_zotero_item(candidate, collection_key, _GENERIC_PROFILE)
-        payload["key"] = _new_zotero_key()
-        payload["version"] = 0
         duplicate = classify_duplicate(candidate, existing)
         duplicate_checks.append(_duplicate_check(candidate, duplicate))
         if duplicate.kind == MatchKind.EXACT_IDENTIFIER and duplicate.item_key:
@@ -153,6 +151,79 @@ def build_item_plan(
         library_version=None,
         server_fingerprint=server_fingerprint(server_id),
         duplicate_checks=tuple(duplicate_checks),
+    )
+
+
+def build_child_plan(
+    candidates: Iterable[CandidateItem],
+    parent_plan: WritePlan,
+    parent_result: ExecutionResult,
+    collection: Mapping[str, Any],
+    parent_objects: Mapping[str, Any],
+    *,
+    profile_name: str,
+    allowed_roots: Iterable[str | Path],
+    server_id: str = "",
+) -> WritePlan:
+    """Build a separately approved child-object plan from verified parent results."""
+    candidate_list = tuple(candidates)
+    roots = tuple(Path(root).resolve(strict=True) for root in allowed_roots)
+    if len(candidate_list) > _MAX_PAPERS_PER_BATCH:
+        raise BatchLimitExceeded("a child plan may contain at most 10 candidate papers")
+    if parent_plan.operation != OperationKind.UPSERT_ITEMS:
+        raise ValueError("children require a completed parent item plan")
+    if parent_result.plan_digest != plan_digest(parent_plan):
+        raise PreviewStale("parent result does not match the parent plan")
+    if not parent_result.verified or parent_result.failed:
+        raise PreviewStale("parent plan must complete and verify before child preview")
+    parent_payloads = _item_payloads(parent_plan)
+    parent_keys = tuple(parent_result.resolved_keys)
+    if not candidate_list or len(candidate_list) != len(parent_payloads) or len(candidate_list) != len(parent_keys):
+        raise ValueError("candidate, parent-plan, and parent-result counts must match")
+    if any(not key for key in parent_keys):
+        raise PreviewStale("every parent result requires a resolved Zotero key")
+    if len(parent_plan.duplicate_checks) != len(candidate_list):
+        raise PreviewStale("parent candidate bindings are incomplete")
+    collection_key = str(collection.get("key", ""))
+    if not collection_key or collection_key != parent_plan.collection_key:
+        raise PreviewStale("child preview targets a different Collection")
+    collection_version = _object_version(collection)
+    if collection_version is None:
+        raise ValueError("child preview requires the current Collection version")
+    expected_versions: dict[str, int] = {collection_key: collection_version}
+    children: list[dict[str, Any]] = []
+    for index, (candidate, parent_payload, parent_key) in enumerate(zip(candidate_list, parent_payloads, parent_keys)):
+        if not isinstance(candidate, CandidateItem):
+            raise TypeError("candidates must be CandidateItem instances")
+        if canonical_json(_candidate_binding(candidate)) != canonical_json(_check_binding(parent_plan.duplicate_checks[index])):
+            raise PreviewStale("candidate input changed after the parent preview")
+        parent_object = parent_objects.get(parent_key)
+        parent_data = _object_data(parent_object)
+        parent_version = _object_version(parent_object)
+        if not parent_data or parent_version is None:
+            raise PreviewStale(f"parent {parent_key} could not be verified")
+        mismatches: dict[str, str] = {}
+        _compare_item_fields(parent_payload, parent_data, parent_key, mismatches)
+        if mismatches:
+            raise PreviewStale(f"parent {parent_key} changed after creation")
+        expected_versions[parent_key] = parent_version
+        children.append({
+            "itemType": "note",
+            "parentItem": parent_key,
+            "note": render_note(candidate, profile_name),
+        })
+        if candidate.linked_pdf:
+            children.append(build_linked_attachment(parent_key, candidate.linked_pdf, roots))
+    return WritePlan(
+        operation=OperationKind.CREATE_CHILDREN,
+        collection_key=collection_key,
+        collection_name=str(collection.get("name", "")),
+        actions=(WriteAction("create_children", tuple(children)),),
+        expected_versions=expected_versions,
+        library_version=None,
+        server_fingerprint=server_fingerprint(server_id),
+        duplicate_checks=(),
+        allowed_roots=tuple(str(root) for root in roots),
     )
 
 
@@ -203,6 +274,7 @@ def execute_plan(
             discard(authorization)
 
     successful, unchanged, failed = _parse_write_response(response, plan)
+    resolved = _response_keys_in_order(response, _approved_payloads(plan))
     affected_keys = tuple(dict.fromkeys((*successful, *unchanged)))
     try:
         fetched = _fetch_objects(client, plan, affected_keys)
@@ -226,6 +298,7 @@ def execute_plan(
         plan_digest=calculated_digest,
         successful_keys=successful,
         unchanged_keys=unchanged,
+        resolved_keys=resolved,
         failed=failed | mismatches,
         verified=readback_ok,
     )
@@ -340,6 +413,26 @@ def _validate_plan(plan: WritePlan) -> None:
             raise ValueError("every top-level paper requires a bound duplicate check")
         for payload in payloads:
             _validate_item_payload(plan, payload)
+    elif plan.operation == OperationKind.CREATE_CHILDREN:
+        if action_kinds != ("create_children",) or not plan.collection_key:
+            raise ValueError("a child plan must target one existing collection")
+        payloads = _approved_payloads(plan)
+        if not payloads or len(payloads) > _MAX_PAPERS_PER_BATCH * 2:
+            raise BatchLimitExceeded("a child plan requires between 1 and 20 objects")
+        parent_keys = {str(payload.get("parentItem", "")) for payload in payloads}
+        if "" in parent_keys or len(parent_keys) > _MAX_PAPERS_PER_BATCH:
+            raise ValueError("child payloads require at most 10 resolved parents")
+        if set(plan.expected_versions) != {plan.collection_key, *parent_keys}:
+            raise ValueError("child plan versions must bind only the Collection and resolved parents")
+        if plan.duplicate_checks:
+            raise ValueError("child plans cannot carry duplicate bindings")
+        counts: dict[tuple[str, str], int] = {}
+        for payload in payloads:
+            _validate_item_payload(plan, payload)
+            identity = (str(payload.get("parentItem", "")), str(payload.get("itemType", "")))
+            counts[identity] = counts.get(identity, 0) + 1
+            if counts[identity] > 1:
+                raise ValueError("a child plan may create at most one note and one attachment per parent")
     else:
         raise ValueError("unknown write plan operation")
 
@@ -350,17 +443,23 @@ def _validate_item_payload(plan: WritePlan, payload: Mapping[str, Any]) -> None:
     item_type = str(payload.get("itemType", ""))
     key = str(payload.get("key", ""))
     version = payload.get("version")
-    if not key or not isinstance(version, int) or version < 0:
-        raise ValueError("every planned Zotero object requires a key and non-negative version")
-    if version > 0 and plan.expected_versions.get(key) != version:
+    has_key = "key" in payload
+    has_version = "version" in payload
+    if has_key != has_version:
+        raise ValueError("key and version must either both be present or both be absent")
+    if has_version and (not key or not isinstance(version, int) or version <= 0):
+        raise ValueError("new Zotero objects must omit key/version; existing objects require a positive version")
+    if has_version and plan.expected_versions.get(key) != version:
         raise ValueError("every existing Zotero object requires its approved version")
     if item_type == "journalArticle":
-        allowed = _PARENT_REUSE_FIELDS if version > 0 else _PARENT_CREATE_FIELDS
+        if plan.operation != OperationKind.UPSERT_ITEMS:
+            raise ValueError("journal items belong only in the parent phase")
+        allowed = _PARENT_REUSE_FIELDS if has_version else _PARENT_CREATE_FIELDS
         if not set(payload).issubset(allowed):
             raise ValueError("journal item payload contains unsafe or unknown mutation fields")
-        if version > 0 and "tags" in payload:
+        if has_version and "tags" in payload:
             raise ValueError("existing Zotero tags cannot be cleared or replaced")
-        if version == 0 and not str(payload.get("title", "")).strip():
+        if not has_version and not str(payload.get("title", "")).strip():
             raise ValueError("new journal items require a title")
         collections = payload.get("collections")
         if not isinstance(collections, (list, tuple)) or plan.collection_key not in map(str, collections):
@@ -369,14 +468,16 @@ def _validate_item_payload(plan: WritePlan, payload: Mapping[str, Any]) -> None:
             raise ValueError("tags must be an explicit list")
         return
     if item_type == "note":
+        if plan.operation != OperationKind.CREATE_CHILDREN or has_key or has_version:
+            raise ValueError("new notes require a separately approved keyless child plan")
         if not set(payload).issubset(_NOTE_FIELDS) or _CODEX_NOTE_MARKER not in str(payload.get("note", "")):
             raise ValueError("only stable-marker Codex notes may be created or updated")
-        if version != 0:
-            raise ValueError("existing Zotero notes cannot be updated by this version")
         if not str(payload.get("parentItem", "")):
             raise ValueError("Codex notes require a parent item")
         return
     if item_type == "attachment":
+        if plan.operation != OperationKind.CREATE_CHILDREN or has_key or has_version:
+            raise ValueError("new attachments require a separately approved keyless child plan")
         if not set(payload).issubset(_ATTACHMENT_FIELDS):
             raise ValueError("attachment payload contains unsafe or unknown fields")
         if payload.get("linkMode") != "linked_file" or payload.get("contentType") != "application/pdf":
@@ -536,6 +637,29 @@ def _response_keys(group: Any, payloads: tuple[Mapping[str, Any], ...]) -> tuple
     return tuple(keys)
 
 
+def _response_keys_in_order(response: Any, payloads: tuple[Mapping[str, Any], ...]) -> tuple[str, ...]:
+    if not isinstance(response, Mapping):
+        return tuple("" for _ in payloads)
+    groups = tuple(group for group in (response.get("successful"), response.get("unchanged")) if isinstance(group, Mapping))
+    resolved: list[str] = []
+    for index, payload in enumerate(payloads):
+        value: Any = None
+        for group in groups:
+            if str(index) in group:
+                value = group[str(index)]
+                break
+            if index in group:
+                value = group[index]
+                break
+        if isinstance(value, Mapping):
+            resolved.append(str(value.get("key", "")) or str(payload.get("key", "")))
+        elif isinstance(value, str):
+            resolved.append(value or str(payload.get("key", "")))
+        else:
+            resolved.append("")
+    return tuple(resolved)
+
+
 def _failure_reasons(group: Any) -> dict[str, str]:
     if not isinstance(group, Mapping):
         return {}
@@ -575,6 +699,23 @@ def _candidate_from_duplicate_check(check: Mapping[str, Any]) -> CandidateItem:
     )
 
 
+def _candidate_binding(candidate: CandidateItem) -> dict[str, Any]:
+    return {
+        "title": candidate.title,
+        "creators": [dict(creator) for creator in candidate.creators],
+        "year": candidate.year,
+        "doi": candidate.doi,
+        "pmid": candidate.pmid,
+        "arxiv_id": candidate.arxiv_id,
+    }
+
+
+def _check_binding(check: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: check.get(key, [] if key == "creators" else "") for key in (
+        "title", "creators", "year", "doi", "pmid", "arxiv_id",
+    )}
+
+
 def _duplicate_query(candidate: CandidateItem) -> Mapping[str, str]:
     if candidate.doi:
         return {"doi": candidate.doi}
@@ -583,10 +724,6 @@ def _duplicate_query(candidate: CandidateItem) -> Mapping[str, str]:
     if candidate.arxiv_id:
         return {"q": "arXiv: " + candidate.arxiv_id}
     return {"q": candidate.title}
-
-
-def _new_zotero_key() -> str:
-    return "".join(secrets.choice(_ZOTERO_KEY_ALPHABET) for _ in range(8))
 
 
 def _fetch_objects(client: Any, plan: WritePlan, keys: tuple[str, ...]) -> Mapping[str, Any]:
@@ -616,7 +753,7 @@ def _item_payloads(plan: WritePlan) -> tuple[Mapping[str, Any], ...]:
 
 
 def _approved_payloads(plan: WritePlan) -> tuple[Mapping[str, Any], ...]:
-    if plan.operation != OperationKind.UPSERT_ITEMS or not plan.actions:
+    if plan.operation not in {OperationKind.UPSERT_ITEMS, OperationKind.CREATE_CHILDREN} or not plan.actions:
         return ()
     payload = plan.actions[0].payload
     if isinstance(payload, Mapping):
@@ -627,7 +764,9 @@ def _approved_payloads(plan: WritePlan) -> tuple[Mapping[str, Any], ...]:
 
 
 def _compare_item_fields(expected: Mapping[str, Any], actual: Mapping[str, Any], label: str, mismatches: dict[str, str]) -> None:
-    for field in ("title", "DOI"):
+    for field in ("itemType", "title", "DOI"):
+        if field == "DOI" and expected.get(field) == "" and field not in actual:
+            continue
         if field in expected and actual.get(field) != expected[field]:
             mismatches[f"{label}.{field}"] = "approved value differs from read-back"
     if "collections" in expected:
@@ -728,7 +867,7 @@ def render_note(candidate: CandidateItem, profile_name: str, report_path: str = 
 
 
 def build_linked_attachment(parent_key: str, pdf_path: str | Path, allowed_roots: tuple[str | Path, ...]) -> dict[str, str]:
-    """Build a linked-file attachment after strict final-D-drive validation."""
+    """Build a linked-file attachment after strict approved-root validation."""
     if not parent_key:
         raise ValueError("parent_key is required")
     path = Path(pdf_path)
@@ -743,8 +882,6 @@ def build_linked_attachment(parent_key: str, pdf_path: str | Path, allowed_roots
         raise ValueError("linked PDF and approved roots must exist") from error
     if not resolved_path.is_file():
         raise ValueError("linked PDF path must be a file")
-    if resolved_path.drive.casefold() != "d:":
-        raise ValueError("linked PDF must be in a final D-drive directory")
     if any(part.casefold() in {"tmp", "temp", "cache", ".cache"} for part in resolved_path.parts):
         raise ValueError("linked PDF cannot be in a temporary or cache directory")
     if not resolved_roots or not any(resolved_path.is_relative_to(root) for root in resolved_roots):
@@ -804,9 +941,10 @@ def _evidence_status(candidate: CandidateItem) -> str:
         return "已深度精读"
     if candidate.evidence_level == EvidenceLevel.FULL_TEXT_VERIFIED:
         return "已核查全文"
+    availability = "全文已获取，尚未深读" if _has_accessible_pdf(candidate.linked_pdf) else "状态：待获取全文"
     if candidate.evidence_level == EvidenceLevel.ABSTRACT_ONLY:
-        return "基于摘要；状态：待获取全文"
-    return "仅元数据；状态：待获取全文"
+        return f"基于摘要；{availability}"
+    return f"仅元数据；{availability}"
 
 
 def _canonical_status(candidate: CandidateItem) -> str:
