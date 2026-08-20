@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html import escape
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 from zotero_models import CandidateItem, EvidenceLevel
@@ -15,6 +16,12 @@ _ALLOWED_MICROWAVE_PREFIXES = ("体系：", "实验：", "证据：", "计算：
 _FULL_TEXT_LEVELS = frozenset((EvidenceLevel.FULL_TEXT_VERIFIED, EvidenceLevel.DEEP_READ))
 _UNVERIFIED_FIELD_TOKENS = ("constant", "quotation", "quote", "page")
 _UNVERIFIED_SAFE_FIELDS = frozenset(("relevance", "experiment", "structure", "theory_and_assignment", "use_and_limits"))
+_UNVERIFIED_CLAIM = re.compile(
+    r"(?:\b[A-Za-z][\w-]*\s*=\s*[+-]?\d+(?:[.,]\d+)?(?:\s*(?:GHz|MHz|kHz|Hz|cm-?1))?"
+    r"|\b(?:p(?:age)?\.?\s*\d+|\d+\s*(?:页|pp?\.))"
+    r"|[\"“”‘’])",
+    re.IGNORECASE,
+)
 _TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "assets" / "zotero-brief-note-template.html"
 
 
@@ -23,19 +30,18 @@ def sanitize_tags(candidate: CandidateItem, profile_name: str) -> tuple[str, ...
     _validate_profile(profile_name)
     if profile_name == _GENERIC_PROFILE:
         return ()
-    is_full_text = candidate.evidence_level in _FULL_TEXT_LEVELS
     cleaned: list[str] = []
     for tag in candidate.tags:
         normalized = str(tag).strip()
         if not normalized or not normalized.startswith(_ALLOWED_MICROWAVE_PREFIXES):
             continue
-        if normalized.startswith("状态：") and not is_full_text:
+        if normalized.startswith("状态："):
             continue
         if normalized not in cleaned:
             cleaned.append(normalized)
-    if not is_full_text and not _has_accessible_pdf(candidate.linked_pdf):
-        cleaned = [tag for tag in cleaned if not tag.startswith("状态：")]
-        cleaned.append("状态：待获取全文")
+    status = _canonical_status(candidate)
+    if status:
+        cleaned.append(status)
     return tuple(cleaned)
 
 
@@ -47,8 +53,8 @@ def render_note(candidate: CandidateItem, profile_name: str, report_path: str = 
     substitutions = {
         "NOTE_TITLE": note_title,
         "EVIDENCE_STATUS": _evidence_status(candidate),
-        "RELEVANCE": _text(fields.get("relevance"), candidate.abstract, "未提供"),
-        "EXPERIMENT": _text(fields.get("experiment"), _tags_with_prefix(candidate, "实验："), "未提供"),
+        "RELEVANCE": _text(fields.get("relevance"), _bound_source_text(candidate.abstract, candidate.evidence_level), "未提供"),
+        "EXPERIMENT": _text(fields.get("experiment"), _tags_with_prefix(candidate, "实验：", profile_name), "未提供"),
         "STRUCTURE": _text(fields.get("structure"), "未提供"),
         "THEORY_AND_ASSIGNMENT": _theory_and_assignment(fields),
         "USE_AND_LIMITS": _text(fields.get("use_and_limits"), "仅作为文献线索；请按证据状态使用。"),
@@ -125,7 +131,7 @@ def _safe_note_fields(candidate: CandidateItem) -> Mapping[str, Any]:
     if candidate.evidence_level in _FULL_TEXT_LEVELS:
         return candidate.note_fields
     return {
-        key: value
+        key: _bound_source_text(value, candidate.evidence_level)
         for key, value in candidate.note_fields.items()
         if key in _UNVERIFIED_SAFE_FIELDS
         and not any(token in str(key).casefold() for token in _UNVERIFIED_FIELD_TOKENS)
@@ -142,8 +148,31 @@ def _evidence_status(candidate: CandidateItem) -> str:
     return "仅元数据；状态：待获取全文"
 
 
-def _tags_with_prefix(candidate: CandidateItem, prefix: str) -> str:
-    return "；".join(str(tag) for tag in candidate.tags if str(tag).startswith(prefix))
+def _canonical_status(candidate: CandidateItem) -> str:
+    if candidate.evidence_level == EvidenceLevel.DEEP_READ:
+        return "状态：深度精读"
+    if candidate.evidence_level == EvidenceLevel.FULL_TEXT_VERIFIED:
+        return "状态：全文已核查"
+    if not _has_accessible_pdf(candidate.linked_pdf):
+        return "状态：待获取全文"
+    return ""
+
+
+def _tags_with_prefix(candidate: CandidateItem, prefix: str, profile_name: str) -> str:
+    if profile_name != _MICROWAVE_PROFILE:
+        return ""
+    raw_tags = (str(tag) for tag in candidate.tags if str(tag).startswith(prefix))
+    return "；".join(_bound_source_text(tag, candidate.evidence_level) for tag in raw_tags)
+
+
+def _bound_source_text(value: Any, evidence_level: EvidenceLevel) -> str:
+    """Suppress claims requiring full text from a metadata/abstract-only note."""
+    text = str(value) if value is not None else ""
+    if evidence_level in _FULL_TEXT_LEVELS or not text:
+        return text
+    if _UNVERIFIED_CLAIM.search(text):
+        return "待获取全文后补充"
+    return text
 
 
 def _theory_and_assignment(fields: Mapping[str, Any]) -> str:
