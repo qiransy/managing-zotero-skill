@@ -142,6 +142,79 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("实验：CP-FTMW", note)
         self.assertNotIn("CP-FTMW", note)
 
+    def test_low_evidence_note_field_blocks_each_claim_category(self):
+        for claim in self._prohibited_low_evidence_claims():
+            with self.subTest(claim=claim):
+                note = render_note(
+                    CandidateItem(
+                        title="A paper",
+                        evidence_level=EvidenceLevel.ABSTRACT_ONLY,
+                        note_fields={"relevance": claim},
+                    ),
+                    "microwave-spectroscopy",
+                )
+                self.assertNotIn(claim, note)
+
+    def test_low_evidence_abstract_fallback_blocks_each_claim_category(self):
+        for claim in self._prohibited_low_evidence_claims():
+            with self.subTest(claim=claim):
+                note = render_note(
+                    CandidateItem(
+                        title="A paper",
+                        abstract=claim,
+                        evidence_level=EvidenceLevel.ABSTRACT_ONLY,
+                    ),
+                    "microwave-spectroscopy",
+                )
+                self.assertNotIn(claim, note)
+
+    def test_low_evidence_tag_derived_note_text_blocks_each_claim_category(self):
+        for claim in self._prohibited_low_evidence_claims():
+            tag = "实验：" + claim
+            with self.subTest(claim=claim):
+                note = render_note(
+                    CandidateItem(
+                        title="A paper",
+                        tags=(tag,),
+                        evidence_level=EvidenceLevel.ABSTRACT_ONLY,
+                    ),
+                    "microwave-spectroscopy",
+                )
+                self.assertNotIn(claim, note)
+
+    def test_low_evidence_sanitized_tags_block_each_claim_category(self):
+        for claim in self._prohibited_low_evidence_claims():
+            tag = "证据：" + claim
+            with self.subTest(claim=claim):
+                tags = sanitize_tags(
+                    CandidateItem(
+                        title="A paper",
+                        tags=(tag,),
+                        evidence_level=EvidenceLevel.ABSTRACT_ONLY,
+                    ),
+                    "microwave-spectroscopy",
+                )
+                self.assertNotIn(tag, tags)
+
+    def test_low_evidence_preserves_legitimate_controlled_tags(self):
+        tags = sanitize_tags(
+            CandidateItem(
+                title="A paper",
+                tags=("实验：CP-FTMW",),
+                evidence_level=EvidenceLevel.ABSTRACT_ONLY,
+            ),
+            "microwave-spectroscopy",
+        )
+        self.assertIn("实验：CP-FTMW", tags)
+
+    @staticmethod
+    def _prohibited_low_evidence_claims():
+        return (
+            "A: 1234.567 MHz",
+            "pp. 4–5",
+            "「quoted」",
+        )
+
     def test_item_payload_has_bibliographic_data_without_overwriting_notes(self):
         candidate = CandidateItem(
             title="A paper",

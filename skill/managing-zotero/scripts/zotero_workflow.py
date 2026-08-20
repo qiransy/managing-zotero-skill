@@ -17,9 +17,10 @@ _FULL_TEXT_LEVELS = frozenset((EvidenceLevel.FULL_TEXT_VERIFIED, EvidenceLevel.D
 _UNVERIFIED_FIELD_TOKENS = ("constant", "quotation", "quote", "page")
 _UNVERIFIED_SAFE_FIELDS = frozenset(("relevance", "experiment", "structure", "theory_and_assignment", "use_and_limits"))
 _UNVERIFIED_CLAIM = re.compile(
-    r"(?:\b[A-Za-z][\w-]*\s*=\s*[+-]?\d+(?:[.,]\d+)?(?:\s*(?:GHz|MHz|kHz|Hz|cm-?1))?"
-    r"|\b(?:p(?:age)?\.?\s*\d+|\d+\s*(?:页|pp?\.))"
-    r"|[\"“”‘’])",
+    r"(?:\b(?:[A-Za-zµμ][\wµμ-]*\s*[:=]\s*)?[+-]?\d+(?:[.,]\d+)?\s*(?:GHz|MHz|kHz|Hz|cm\s*\^?-?1)"
+    r"|\b(?:p|pp|page|pages)\.?\s*\d+(?:\s*(?:-|–|—)\s*\d+)?"
+    r"|第?\s*\d+(?:\s*(?:-|–|—|至|到)\s*\d+)?\s*页"
+    r"|[\"“”‘’「」『』])",
     re.IGNORECASE,
 )
 _TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "assets" / "zotero-brief-note-template.html"
@@ -36,6 +37,8 @@ def sanitize_tags(candidate: CandidateItem, profile_name: str) -> tuple[str, ...
         if not normalized or not normalized.startswith(_ALLOWED_MICROWAVE_PREFIXES):
             continue
         if normalized.startswith("状态："):
+            continue
+        if candidate.evidence_level not in _FULL_TEXT_LEVELS and _contains_unverified_claim(normalized):
             continue
         if normalized not in cleaned:
             cleaned.append(normalized)
@@ -170,9 +173,13 @@ def _bound_source_text(value: Any, evidence_level: EvidenceLevel) -> str:
     text = str(value) if value is not None else ""
     if evidence_level in _FULL_TEXT_LEVELS or not text:
         return text
-    if _UNVERIFIED_CLAIM.search(text):
+    if _contains_unverified_claim(text):
         return "待获取全文后补充"
     return text
+
+
+def _contains_unverified_claim(text: str) -> bool:
+    return bool(_UNVERIFIED_CLAIM.search(text))
 
 
 def _theory_and_assignment(fields: Mapping[str, Any]) -> str:
